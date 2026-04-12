@@ -8,6 +8,8 @@
 #include <stdarg.h>
 #include <string.h>
 
+#include "app_context.h"
+
 /* Keep DRDY accounting aligned with the app's 4 s major cycle. */
 #define DRDY_WINDOW_US 4000000ULL
 
@@ -79,7 +81,13 @@ static void drdy_append_fmt(char *buf, size_t buf_size, size_t *offset, const ch
 
 static int read_status_reg(const struct i2c_dt_spec *spec, uint8_t reg, uint8_t *value)
 {
-	return i2c_reg_read_byte_dt(spec, reg, value);
+	int ret;
+
+	k_mutex_lock(&sensor_lock, K_FOREVER);
+	ret = i2c_reg_read_byte_dt(spec, reg, value);
+	k_mutex_unlock(&sensor_lock);
+
+	return ret;
 }
 
 static void update_counter(struct drdy_counter *counter, bool data_ready, bool overrun)
@@ -156,10 +164,15 @@ int sensor_drdy_init(void)
 void sensor_drdy_poll_accel(void)
 {
 	uint8_t status;
+	int ret;
+
+	ret = read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status);
+	if (ret < 0) {
+		return;
+	}
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status) < 0) {
+	if (!drdy_state.initialized) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
@@ -171,10 +184,15 @@ void sensor_drdy_poll_accel(void)
 void sensor_drdy_poll_gyro(void)
 {
 	uint8_t status;
+	int ret;
+
+	ret = read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status);
+	if (ret < 0) {
+		return;
+	}
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status) < 0) {
+	if (!drdy_state.initialized) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
@@ -187,10 +205,15 @@ void sensor_drdy_poll_hts221(void)
 {
 	uint8_t status;
 	bool ready;
+	int ret;
+
+	ret = read_status_reg(&hts221_i2c, HTS221_REG_STATUS, &status);
+	if (ret < 0) {
+		return;
+	}
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    read_status_reg(&hts221_i2c, HTS221_REG_STATUS, &status) < 0) {
+	if (!drdy_state.initialized) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
@@ -203,10 +226,15 @@ void sensor_drdy_poll_hts221(void)
 void sensor_drdy_poll_lis3mdl(void)
 {
 	uint8_t status;
+	int ret;
+
+	ret = read_status_reg(&lis3mdl_i2c, LIS3MDL_REG_STATUS, &status);
+	if (ret < 0) {
+		return;
+	}
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    read_status_reg(&lis3mdl_i2c, LIS3MDL_REG_STATUS, &status) < 0) {
+	if (!drdy_state.initialized) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
@@ -220,10 +248,15 @@ void sensor_drdy_poll_lis3mdl(void)
 void sensor_drdy_poll_lps22hb(void)
 {
 	uint8_t status;
+	int ret;
+
+	ret = read_status_reg(&lps22hb_i2c, LPS22HB_REG_STATUS, &status);
+	if (ret < 0) {
+		return;
+	}
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    read_status_reg(&lps22hb_i2c, LPS22HB_REG_STATUS, &status) < 0) {
+	if (!drdy_state.initialized) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
