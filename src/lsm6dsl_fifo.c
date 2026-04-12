@@ -8,19 +8,43 @@
 
 #include "app_context.h"
 
+/* FIFO threshold low byte. We clear it because this app polls instead of using a watermark. */
 #define LSM6DSL_REG_FIFO_CTRL1 0x06
+
+/* FIFO threshold high bits and related FIFO control bits. Also cleared for no watermark. */
 #define LSM6DSL_REG_FIFO_CTRL2 0x07
+
+/* FIFO decimation selector: chooses accel/gyro streams and their decimation. */
 #define LSM6DSL_REG_FIFO_CTRL3 0x08
+
+/* FIFO ODR and FIFO operating mode, such as bypass or stream mode. */
 #define LSM6DSL_REG_FIFO_CTRL5 0x0A
+
+/* FIFO unread level low byte; burst-read with STATUS2 to get the full level. */
 #define LSM6DSL_REG_FIFO_STATUS1 0x3A
+
+/* FIFO data output start register; burst reads consume samples from hardware FIFO. */
 #define LSM6DSL_REG_FIFO_DATA_OUT_L 0x3E
 
+/* Put every accel sample into FIFO; no accelerometer decimation. */
 #define LSM6DSL_FIFO_XL_NO_DEC 1U
+
+/* Do not store gyro samples in FIFO because HAR only needs acceleration. */
 #define LSM6DSL_FIFO_GY_DISABLE 0U
+
+/* FIFO output data rate code for 26 Hz. */
 #define LSM6DSL_FIFO_26HZ 2U
+
+/* FIFO mode code that keeps accepting new samples after it becomes non-empty. */
 #define LSM6DSL_FIFO_STREAM_MODE 6U
+
+/* FIFO mode code used to stop/reset FIFO before reprogramming it. */
 #define LSM6DSL_FIFO_BYPASS_MODE 0U
+
+/* One accel sample is X/Y/Z, each stored as one 16-bit FIFO word. */
 #define LSM6DSL_FIFO_WORDS_PER_ACCEL_SAMPLE 3U
+
+/* Default +-2g accel sensitivity from the LSM6DSL driver: 61 micro-g per LSB. */
 #define LSM6DSL_ACCEL_SENSITIVITY_UG_PER_LSB 61LL
 
 static const struct i2c_dt_spec lsm6dsl_i2c = I2C_DT_SPEC_GET(DT_INST(0, st_lsm6dsl));
