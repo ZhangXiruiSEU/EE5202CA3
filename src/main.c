@@ -16,6 +16,7 @@
 #include "HARnet/network.h"
 #include "sensor_drdy.h"
 
+/* Spread 104 accel polls evenly across a 4 s major cycle. */
 #define MAJOR_CYCLE_US 4000000ULL
 #define ACCEL_EVENTS_PER_MAJOR 104U
 #define ACCEL_INTERVAL_BASE_US (MAJOR_CYCLE_US / ACCEL_EVENTS_PER_MAJOR)
@@ -25,7 +26,6 @@
 #define ENV_PERIOD_US 1000000ULL
 #define HAR_PERIOD_US 1000000ULL
 #define PRINT_PERIOD_US 1000000ULL
-#define UART_BAUD_RATE 115200ULL
 #define STATUS_MSG_SIZE 384
 #define HTS221_PHASE_US 200000ULL
 #define LPS22HB_PHASE_US 400000ULL
@@ -35,6 +35,23 @@
 #define HAR_WINDOW_SAMPLES 26
 #define HAR_AXES 3
 #define HAR_INPUT_SCALE_MG 4000.0f
+#define ACCEL_QUEUE_DEPTH 128
+#define URGENT_BLOCK_MIN_US 30000U
+#define URGENT_BLOCK_MAX_US 50000U
+#define URGENT_SLEEP_MIN_MS 250U
+#define URGENT_SLEEP_MAX_MS 900U
+
+#define URGENT_THREAD_PRIO 0
+#define ACCEL_THREAD_PRIO 1
+#define GYRO_THREAD_PRIO 2
+#define AUX_THREAD_PRIO 3
+#define HAR_THREAD_PRIO 4
+#define PRINT_THREAD_PRIO 5
+
+#define URGENT_STACK_SIZE 1024
+#define SENSOR_STACK_SIZE 2048
+#define HAR_STACK_SIZE 4096
+#define PRINT_STACK_SIZE 2048
 
 struct app_context {
 	const struct device *lsm6dsl_dev;
@@ -51,14 +68,18 @@ struct app_context {
 	uint64_t har_us;
 	int har_status;
 	float har_scores[3];
+	size_t har_sample_count;
+	uint32_t accel_queue_drops;
+	uint32_t accel_late_samples;
+	uint32_t accel_max_late_us;
+	uint32_t urgent_events;
+	uint32_t urgent_last_block_us;
 };
 
-typedef void (*scheduler_task_fn)(struct app_context *ctx);
-
-struct scheduler_task {
-	uint64_t period_us;
-	uint64_t next_release_us;
-	scheduler_task_fn run;
+struct accel_sample {
+	struct sensor_value accel[3];
+	uint64_t timestamp_us;
+	uint32_t late_us;
 };
 
 STAI_NETWORK_CONTEXT_DECLARE(har_network_ctx, STAI_NETWORK_CONTEXT_SIZE);
@@ -75,12 +96,46 @@ static struct app_context app = {
 	.hts221_dev = DEVICE_DT_GET_ONE(st_hts221),
 	.lis3mdl_dev = DEVICE_DT_GET_ONE(st_lis3mdl_magn),
 	.lps22hb_dev = DEVICE_DT_GET_ONE(st_lps22hb_press),
+	.har_status = 1,
 };
-static struct scheduler_task scheduler_tasks[6];
+
+K_MUTEX_DEFINE(app_lock);
+K_MUTEX_DEFINE(sensor_lock);
+K_MSGQ_DEFINE(accel_msgq, sizeof(struct accel_sample), ACCEL_QUEUE_DEPTH, 4);
+
+K_THREAD_STACK_DEFINE(urgent_stack, URGENT_STACK_SIZE);
+K_THREAD_STACK_DEFINE(accel_stack, SENSOR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(gyro_stack, SENSOR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(hts221_stack, SENSOR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(lis3mdl_stack, SENSOR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(lps22hb_stack, SENSOR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(har_stack, HAR_STACK_SIZE);
+K_THREAD_STACK_DEFINE(print_stack, PRINT_STACK_SIZE);
+
+static struct k_thread urgent_thread_data;
+static struct k_thread accel_thread_data;
+static struct k_thread gyro_thread_data;
+static struct k_thread hts221_thread_data;
+static struct k_thread lis3mdl_thread_data;
+static struct k_thread lps22hb_thread_data;
+static struct k_thread har_thread_data;
+static struct k_thread print_thread_data;
 
 static uint64_t now_us(void)
 {
 	return k_ticks_to_us_floor64(k_uptime_ticks());
+}
+
+static uint32_t pseudo_random32(void)
+{
+	static uint32_t state;
+
+	if (state == 0U) {
+		state = k_cycle_get_32() ^ 0xa5a55a5aU;
+	}
+
+	state = state * 1664525U + 1013904223U;
+	return state;
 }
 
 static const char *const har_labels[3] = {
@@ -92,6 +147,7 @@ static void append_fmt(char *buf, size_t buf_size, size_t *offset, const char *f
 
 static void accel_schedule_advance(uint64_t *next_accel_us, uint32_t *accel_remainder_accum)
 {
+	/* Use integer remainder accumulation to avoid long-term drift. */
 	*next_accel_us += ACCEL_INTERVAL_BASE_US;
 	*accel_remainder_accum += ACCEL_INTERVAL_REM_US;
 	if (*accel_remainder_accum >= ACCEL_EVENTS_PER_MAJOR) {
@@ -128,6 +184,7 @@ static void append_text(char *buf, size_t buf_size, size_t *offset, const char *
 static void append_sensor_value(char *buf, size_t buf_size, size_t *offset,
 			       const struct sensor_value *value)
 {
+	/* Zephyr sensor values store the fractional part in micro-units. */
 	int64_t micro = (int64_t)value->val1 * 1000000LL + value->val2;
 
 	if (*offset >= buf_size) {
@@ -158,8 +215,18 @@ static void append_score(char *buf, size_t buf_size, size_t *offset, float value
 	append_fmt(buf, buf_size, offset, "%d.%03d", scaled / 1000, scaled % 1000);
 }
 
+static void sleep_until_us(uint64_t target_us)
+{
+	uint64_t current_us = now_us();
+
+	if (current_us < target_us) {
+		k_sleep(K_USEC((int32_t)(target_us - current_us)));
+	}
+}
+
 static float accel_to_model_input(const struct sensor_value *accel)
 {
+	/* Match the normalization used when the HAR model was trained. */
 	return (float)sensor_ms2_to_mg(accel) / HAR_INPUT_SCALE_MG;
 }
 
@@ -184,6 +251,8 @@ static int read_accel(const struct device *dev, struct sensor_value accel[3])
 static void task_read_hts221(struct app_context *ctx)
 {
 	int ret;
+	struct sensor_value humidity;
+	struct sensor_value temperature;
 
 	sensor_drdy_poll_hts221();
 
@@ -193,21 +262,28 @@ static void task_read_hts221(struct app_context *ctx)
 		return;
 	}
 
-	ret = sensor_channel_get(ctx->hts221_dev, SENSOR_CHAN_HUMIDITY, &ctx->humidity);
+	ret = sensor_channel_get(ctx->hts221_dev, SENSOR_CHAN_HUMIDITY, &humidity);
 	if (ret < 0) {
 		printk("HTS221 humidity read failed: %d\n", ret);
 		return;
 	}
 
-	ret = sensor_channel_get(ctx->hts221_dev, SENSOR_CHAN_AMBIENT_TEMP, &ctx->temperature);
+	ret = sensor_channel_get(ctx->hts221_dev, SENSOR_CHAN_AMBIENT_TEMP, &temperature);
 	if (ret < 0) {
 		printk("HTS221 temperature read failed: %d\n", ret);
+		return;
 	}
+
+	k_mutex_lock(&app_lock, K_FOREVER);
+	ctx->humidity = humidity;
+	ctx->temperature = temperature;
+	k_mutex_unlock(&app_lock);
 }
 
 static void task_read_gyro(struct app_context *ctx)
 {
 	int ret;
+	struct sensor_value gyro[3];
 
 	sensor_drdy_poll_gyro();
 
@@ -217,15 +293,21 @@ static void task_read_gyro(struct app_context *ctx)
 		return;
 	}
 
-	ret = sensor_channel_get(ctx->lsm6dsl_dev, SENSOR_CHAN_GYRO_XYZ, ctx->gyro);
+	ret = sensor_channel_get(ctx->lsm6dsl_dev, SENSOR_CHAN_GYRO_XYZ, gyro);
 	if (ret < 0) {
 		printk("LSM6DSL gyro read failed: %d\n", ret);
+		return;
 	}
+
+	k_mutex_lock(&app_lock, K_FOREVER);
+	memcpy(ctx->gyro, gyro, sizeof(ctx->gyro));
+	k_mutex_unlock(&app_lock);
 }
 
 static void task_read_lis3mdl(struct app_context *ctx)
 {
 	int ret;
+	struct sensor_value magnetic[3];
 
 	sensor_drdy_poll_lis3mdl();
 
@@ -235,15 +317,21 @@ static void task_read_lis3mdl(struct app_context *ctx)
 		return;
 	}
 
-	ret = sensor_channel_get(ctx->lis3mdl_dev, SENSOR_CHAN_MAGN_XYZ, ctx->magnetic);
+	ret = sensor_channel_get(ctx->lis3mdl_dev, SENSOR_CHAN_MAGN_XYZ, magnetic);
 	if (ret < 0) {
 		printk("LIS3MDL read failed: %d\n", ret);
+		return;
 	}
+
+	k_mutex_lock(&app_lock, K_FOREVER);
+	memcpy(ctx->magnetic, magnetic, sizeof(ctx->magnetic));
+	k_mutex_unlock(&app_lock);
 }
 
 static void task_read_lps22hb(struct app_context *ctx)
 {
 	int ret;
+	struct sensor_value pressure;
 
 	sensor_drdy_poll_lps22hb();
 
@@ -253,10 +341,15 @@ static void task_read_lps22hb(struct app_context *ctx)
 		return;
 	}
 
-	ret = sensor_channel_get(ctx->lps22hb_dev, SENSOR_CHAN_PRESS, &ctx->pressure);
+	ret = sensor_channel_get(ctx->lps22hb_dev, SENSOR_CHAN_PRESS, &pressure);
 	if (ret < 0) {
 		printk("LPS22HB pressure read failed: %d\n", ret);
+		return;
 	}
+
+	k_mutex_lock(&app_lock, K_FOREVER);
+	ctx->pressure = pressure;
+	k_mutex_unlock(&app_lock);
 }
 
 static int har_init(void)
@@ -268,6 +361,7 @@ static int har_init(void)
 	stai_size n_inputs;
 	stai_size n_outputs;
 
+	/* Resolve the generated model buffers once and reuse them forever. */
 	rc = stai_network_init(har_network_ctx);
 	if (rc != STAI_SUCCESS) {
 		printk("HAR init failed: 0x%x\n", rc);
@@ -313,15 +407,48 @@ static bool har_push_sample(const struct sensor_value accel[3])
 		har_count++;
 	}
 
+	k_mutex_lock(&app_lock, K_FOREVER);
+	app.har_sample_count = har_count;
+	k_mutex_unlock(&app_lock);
+
+	/* Inference can only start once the rolling window is completely filled. */
 	return har_count == HAR_WINDOW_SAMPLES;
 }
 
-static void task_accel_sample(struct app_context *ctx)
+static void task_accel_sample(struct app_context *ctx, uint64_t timestamp_us, uint32_t late_us)
 {
+	struct accel_sample sample = {
+		.timestamp_us = timestamp_us,
+		.late_us = late_us,
+	};
+	struct accel_sample dropped;
+
 	sensor_drdy_poll_accel();
 
-	if (read_accel(ctx->lsm6dsl_dev, ctx->accel) == 0) {
-		(void)har_push_sample(ctx->accel);
+	if (read_accel(ctx->lsm6dsl_dev, sample.accel) != 0) {
+		return;
+	}
+
+	k_mutex_lock(&app_lock, K_FOREVER);
+	memcpy(ctx->accel, sample.accel, sizeof(ctx->accel));
+	if (late_us > 0U) {
+		ctx->accel_late_samples++;
+		if (late_us > ctx->accel_max_late_us) {
+			ctx->accel_max_late_us = late_us;
+		}
+	}
+	k_mutex_unlock(&app_lock);
+
+	if (k_msgq_put(&accel_msgq, &sample, K_NO_WAIT) == 0) {
+		return;
+	}
+
+	/* Cyclic buffering policy: make room by discarding the oldest sample. */
+	if (k_msgq_get(&accel_msgq, &dropped, K_NO_WAIT) == 0 &&
+	    k_msgq_put(&accel_msgq, &sample, K_NO_WAIT) == 0) {
+		k_mutex_lock(&app_lock, K_FOREVER);
+		ctx->accel_queue_drops++;
+		k_mutex_unlock(&app_lock);
 	}
 }
 
@@ -334,10 +461,16 @@ static int har_run_inference_cached(struct app_context *ctx)
 	uint64_t elapsed_us;
 
 	if (har_count < HAR_WINDOW_SAMPLES) {
+		k_mutex_lock(&app_lock, K_FOREVER);
 		ctx->har_status = 1;
+		k_mutex_unlock(&app_lock);
 		return 1;
 	}
 
+	/*
+	 * The ring buffer wraps continuously, so rebuild a linear input tensor
+	 * in oldest-to-newest order before invoking the network.
+	 */
 	for (size_t i = 0; i < HAR_WINDOW_SAMPLES; i++) {
 		size_t src_index = (har_write_index + i) % HAR_WINDOW_SAMPLES;
 
@@ -349,29 +482,40 @@ static int har_run_inference_cached(struct app_context *ctx)
 	end_cycles = k_cycle_get_32();
 	if (rc != STAI_SUCCESS) {
 		printk("HAR inference failed: 0x%x\n", rc);
+		k_mutex_lock(&app_lock, K_FOREVER);
 		ctx->har_status = -EIO;
+		k_mutex_unlock(&app_lock);
 		return -EIO;
 	}
 
 	elapsed_cycles = end_cycles - start_cycles;
 	elapsed_us = k_cyc_to_us_floor64(elapsed_cycles);
+	k_mutex_lock(&app_lock, K_FOREVER);
 	ctx->har_cycles = elapsed_cycles;
 	ctx->har_us = elapsed_us;
 	ctx->har_scores[0] = har_output[0];
 	ctx->har_scores[1] = har_output[1];
 	ctx->har_scores[2] = har_output[2];
 	ctx->har_status = 0;
+	k_mutex_unlock(&app_lock);
 	return 0;
 }
 
 static void task_run_har_measure(struct app_context *ctx)
 {
+	struct accel_sample sample;
+
+	while (k_msgq_get(&accel_msgq, &sample, K_NO_WAIT) == 0) {
+		(void)har_push_sample(sample.accel);
+	}
+
 	(void)har_run_inference_cached(ctx);
 }
 
 static void task_print_status(struct app_context *ctx)
 {
 	size_t len = 0;
+	struct app_context snapshot;
 
 	sensor_drdy_format_report(drdy_msg, sizeof(drdy_msg), now_us());
 	if (drdy_msg[0] != '\0') {
@@ -379,45 +523,55 @@ static void task_print_status(struct app_context *ctx)
 		return;
 	}
 
+	k_mutex_lock(&app_lock, K_FOREVER);
+	snapshot = *ctx;
+	k_mutex_unlock(&app_lock);
+
 	append_fmt(status_msg, sizeof(status_msg), &len, "t=%llu ms | hum=",
 		  (unsigned long long)k_uptime_get());
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->humidity);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.humidity);
 	append_text(status_msg, sizeof(status_msg), &len, " % | temp=");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->temperature);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.temperature);
 	append_text(status_msg, sizeof(status_msg), &len, " C | press=");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->pressure);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.pressure);
 	append_text(status_msg, sizeof(status_msg), &len, " kPa | gyro=(");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->gyro[0]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.gyro[0]);
 	append_text(status_msg, sizeof(status_msg), &len, ",");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->gyro[1]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.gyro[1]);
 	append_text(status_msg, sizeof(status_msg), &len, ",");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->gyro[2]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.gyro[2]);
 	append_text(status_msg, sizeof(status_msg), &len, ") rad/s | mag=(");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->magnetic[0]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.magnetic[0]);
 	append_text(status_msg, sizeof(status_msg), &len, ",");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->magnetic[1]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.magnetic[1]);
 	append_text(status_msg, sizeof(status_msg), &len, ",");
-	append_sensor_value(status_msg, sizeof(status_msg), &len, &ctx->magnetic[2]);
+	append_sensor_value(status_msg, sizeof(status_msg), &len, &snapshot.magnetic[2]);
 	append_text(status_msg, sizeof(status_msg), &len, ") gauss | har=");
 
-	if (ctx->har_status == 0) {
+	if (snapshot.har_status == 0) {
 		append_text(status_msg, sizeof(status_msg), &len, har_labels[0]);
 		append_text(status_msg, sizeof(status_msg), &len, ":");
-		append_score(status_msg, sizeof(status_msg), &len, ctx->har_scores[0]);
+		append_score(status_msg, sizeof(status_msg), &len, snapshot.har_scores[0]);
 		append_text(status_msg, sizeof(status_msg), &len, ",");
 		append_text(status_msg, sizeof(status_msg), &len, har_labels[1]);
 		append_text(status_msg, sizeof(status_msg), &len, ":");
-		append_score(status_msg, sizeof(status_msg), &len, ctx->har_scores[1]);
+		append_score(status_msg, sizeof(status_msg), &len, snapshot.har_scores[1]);
 		append_text(status_msg, sizeof(status_msg), &len, ",");
 		append_text(status_msg, sizeof(status_msg), &len, har_labels[2]);
 		append_text(status_msg, sizeof(status_msg), &len, ":");
-		append_score(status_msg, sizeof(status_msg), &len, ctx->har_scores[2]);
-		append_fmt(status_msg, sizeof(status_msg), &len, " | infer=%llu.%03llu ms\n",
-			  (unsigned long long)(ctx->har_us / 1000ULL),
-			  (unsigned long long)(ctx->har_us % 1000ULL));
+		append_score(status_msg, sizeof(status_msg), &len, snapshot.har_scores[2]);
+		append_fmt(status_msg, sizeof(status_msg), &len,
+			  " | infer=%llu.%03llu ms | qdrop=%u late=%u maxlate=%u us urgent=%u/%u us\n",
+			  (unsigned long long)(snapshot.har_us / 1000ULL),
+			  (unsigned long long)(snapshot.har_us % 1000ULL),
+			  snapshot.accel_queue_drops,
+			  snapshot.accel_late_samples,
+			  snapshot.accel_max_late_us,
+			  snapshot.urgent_events,
+			  snapshot.urgent_last_block_us);
 	} else {
 		append_fmt(status_msg, sizeof(status_msg), &len, "waiting(%d/%d)\n",
-			  (int)har_count, HAR_WINDOW_SAMPLES);
+			  (int)snapshot.har_sample_count, HAR_WINDOW_SAMPLES);
 	}
 
 	if (len >= sizeof(status_msg)) {
@@ -428,81 +582,192 @@ static void task_print_status(struct app_context *ctx)
 	printk("%s", status_msg);
 }
 
-static void scheduler_init(struct scheduler_task *tasks, uint64_t start_us)
+static void accel_thread(void *p1, void *p2, void *p3)
 {
-	tasks[0].period_us = GYRO_PERIOD_US;
-	tasks[0].next_release_us = start_us;
-	tasks[0].run = task_read_gyro;
-
-	tasks[1].period_us = ENV_PERIOD_US;
-	tasks[1].next_release_us = start_us + HTS221_PHASE_US;
-	tasks[1].run = task_read_hts221;
-
-	tasks[2].period_us = MAG_PERIOD_US;
-	tasks[2].next_release_us = start_us + LIS3MDL_PHASE_US;
-	tasks[2].run = task_read_lis3mdl;
-
-	tasks[3].period_us = ENV_PERIOD_US;
-	tasks[3].next_release_us = start_us + LPS22HB_PHASE_US;
-	tasks[3].run = task_read_lps22hb;
-
-	tasks[4].period_us = HAR_PERIOD_US;
-	tasks[4].next_release_us = start_us + HAR_PHASE_US;
-	tasks[4].run = task_run_har_measure;
-
-	tasks[5].period_us = PRINT_PERIOD_US;
-	tasks[5].next_release_us = start_us + PRINT_PHASE_US;
-	tasks[5].run = task_print_status;
-}
-
-static uint64_t scheduler_next_wakeup(const struct scheduler_task *tasks, size_t task_count,
-				      uint64_t next_accel_us)
-{
-	uint64_t next_wakeup_us = next_accel_us;
-
-	for (size_t i = 0; i < task_count; i++) {
-		if (tasks[i].next_release_us < next_wakeup_us) {
-			next_wakeup_us = tasks[i].next_release_us;
-		}
-	}
-
-	return next_wakeup_us;
-}
-
-static void scheduler_run_strict(struct app_context *ctx)
-{
+	struct app_context *ctx = p1;
 	uint64_t next_accel_us = now_us();
-	uint32_t accel_remainder_accum = 0;
+	uint32_t accel_remainder_accum = 0U;
 
-	scheduler_init(scheduler_tasks, next_accel_us);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
 
 	while (1) {
-		uint64_t current_us = now_us();
-		uint64_t next_wakeup_us = scheduler_next_wakeup(scheduler_tasks,
-						 ARRAY_SIZE(scheduler_tasks),
-						 next_accel_us);
+		uint64_t current_us;
+		uint32_t late_us = 0U;
 
-		if (current_us < next_wakeup_us) {
-			uint64_t sleep_us = next_wakeup_us - current_us;
-
-			k_sleep(K_USEC((int32_t)sleep_us));
-			continue;
+		sleep_until_us(next_accel_us);
+		current_us = now_us();
+		if (current_us > next_accel_us) {
+			late_us = (uint32_t)MIN(current_us - next_accel_us, UINT32_MAX);
 		}
 
-		if (current_us >= next_accel_us) {
-			task_accel_sample(ctx);
-			accel_schedule_advance(&next_accel_us, &accel_remainder_accum);
-		}
-
-		for (size_t i = 0; i < ARRAY_SIZE(scheduler_tasks); i++) {
-			if (current_us >= scheduler_tasks[i].next_release_us) {
-				scheduler_tasks[i].run(ctx);
-				do {
-					scheduler_tasks[i].next_release_us += scheduler_tasks[i].period_us;
-				} while (current_us >= scheduler_tasks[i].next_release_us);
-			}
-		}
+		k_mutex_lock(&sensor_lock, K_FOREVER);
+		task_accel_sample(ctx, current_us, late_us);
+		k_mutex_unlock(&sensor_lock);
+		accel_schedule_advance(&next_accel_us, &accel_remainder_accum);
 	}
+}
+
+static void hts221_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us() + HTS221_PHASE_US;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		k_mutex_lock(&sensor_lock, K_FOREVER);
+		task_read_hts221(ctx);
+		k_mutex_unlock(&sensor_lock);
+
+		do {
+			next_release_us += ENV_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void gyro_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us();
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		k_mutex_lock(&sensor_lock, K_FOREVER);
+		task_read_gyro(ctx);
+		k_mutex_unlock(&sensor_lock);
+
+		do {
+			next_release_us += GYRO_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void lis3mdl_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us() + LIS3MDL_PHASE_US;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		k_mutex_lock(&sensor_lock, K_FOREVER);
+		task_read_lis3mdl(ctx);
+		k_mutex_unlock(&sensor_lock);
+
+		do {
+			next_release_us += MAG_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void lps22hb_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us() + LPS22HB_PHASE_US;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		k_mutex_lock(&sensor_lock, K_FOREVER);
+		task_read_lps22hb(ctx);
+		k_mutex_unlock(&sensor_lock);
+
+		do {
+			next_release_us += ENV_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void har_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us() + HAR_PHASE_US;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		task_run_har_measure(ctx);
+
+		do {
+			next_release_us += HAR_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void print_thread(void *p1, void *p2, void *p3)
+{
+	struct app_context *ctx = p1;
+	uint64_t next_release_us = now_us() + PRINT_PHASE_US;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		sleep_until_us(next_release_us);
+		task_print_status(ctx);
+
+		do {
+			next_release_us += PRINT_PERIOD_US;
+		} while (now_us() >= next_release_us);
+	}
+}
+
+static void urgent_external_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		uint32_t rnd = pseudo_random32();
+		uint32_t sleep_ms = URGENT_SLEEP_MIN_MS +
+				    (rnd % (URGENT_SLEEP_MAX_MS - URGENT_SLEEP_MIN_MS + 1U));
+		uint32_t block_us = URGENT_BLOCK_MIN_US +
+				    (pseudo_random32() %
+				     (URGENT_BLOCK_MAX_US - URGENT_BLOCK_MIN_US + 1U));
+
+		k_sleep(K_MSEC(sleep_ms));
+
+		k_mutex_lock(&app_lock, K_FOREVER);
+		app.urgent_events++;
+		app.urgent_last_block_us = block_us;
+		k_mutex_unlock(&app_lock);
+
+		k_busy_wait(block_us);
+	}
+}
+
+static void start_threads(struct app_context *ctx)
+{
+	k_thread_create(&urgent_thread_data, urgent_stack, K_THREAD_STACK_SIZEOF(urgent_stack),
+			urgent_external_thread, NULL, NULL, NULL,
+			URGENT_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&accel_thread_data, accel_stack, K_THREAD_STACK_SIZEOF(accel_stack),
+			accel_thread, ctx, NULL, NULL, ACCEL_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&gyro_thread_data, gyro_stack, K_THREAD_STACK_SIZEOF(gyro_stack),
+			gyro_thread, ctx, NULL, NULL, GYRO_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&hts221_thread_data, hts221_stack, K_THREAD_STACK_SIZEOF(hts221_stack),
+			hts221_thread, ctx, NULL, NULL, AUX_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&lis3mdl_thread_data, lis3mdl_stack, K_THREAD_STACK_SIZEOF(lis3mdl_stack),
+			lis3mdl_thread, ctx, NULL, NULL, AUX_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&lps22hb_thread_data, lps22hb_stack, K_THREAD_STACK_SIZEOF(lps22hb_stack),
+			lps22hb_thread, ctx, NULL, NULL, AUX_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&har_thread_data, har_stack, K_THREAD_STACK_SIZEOF(har_stack),
+			har_thread, ctx, NULL, NULL, HAR_THREAD_PRIO, 0, K_NO_WAIT);
+	k_thread_create(&print_thread_data, print_stack, K_THREAD_STACK_SIZEOF(print_stack),
+			print_thread, ctx, NULL, NULL, PRINT_THREAD_PRIO, 0, K_NO_WAIT);
 }
 
 int main(void)
@@ -543,6 +808,11 @@ int main(void)
 	}
 
 	printk("HAR window: %d x %d accel samples\n", HAR_WINDOW_SAMPLES, HAR_AXES);
-	scheduler_run_strict(&app);
+	start_threads(&app);
+
+	while (1) {
+		k_sleep(K_FOREVER);
+	}
+
 	return 0;
 }

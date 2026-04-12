@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <string.h>
 
+/* Keep DRDY accounting aligned with the app's 4 s major cycle. */
 #define DRDY_WINDOW_US 4000000ULL
 
 #define LSM6DSL_REG_STATUS_REG 0x1E
@@ -54,6 +55,7 @@ static const struct i2c_dt_spec lis3mdl_i2c = I2C_DT_SPEC_GET(DT_INST(0, st_lis3
 static const struct i2c_dt_spec lps22hb_i2c = I2C_DT_SPEC_GET(DT_INST(0, st_lps22hb_press));
 
 static struct drdy_state drdy_state;
+K_MUTEX_DEFINE(drdy_lock);
 
 static void drdy_append_fmt(char *buf, size_t buf_size, size_t *offset, const char *fmt, ...)
 {
@@ -82,6 +84,7 @@ static int read_status_reg(const struct i2c_dt_spec *spec, uint8_t reg, uint8_t 
 
 static void update_counter(struct drdy_counter *counter, bool data_ready, bool overrun)
 {
+	/* A missing DRDY bit means this poll likely reread the previous sample. */
 	if (data_ready) {
 		counter->captured++;
 	} else {
@@ -143,8 +146,10 @@ int sensor_drdy_init(void)
 		return -ENODEV;
 	}
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	drdy_state.window_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
 	drdy_state.initialized = true;
+	k_mutex_unlock(&drdy_lock);
 	return 0;
 }
 
@@ -152,24 +157,30 @@ void sensor_drdy_poll_accel(void)
 {
 	uint8_t status;
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	if (!drdy_state.initialized ||
 	    read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status) < 0) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	update_counter(&drdy_state.accel, (status & LSM6DSL_STATUS_XLDA) != 0U, false);
+	k_mutex_unlock(&drdy_lock);
 }
 
 void sensor_drdy_poll_gyro(void)
 {
 	uint8_t status;
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	if (!drdy_state.initialized ||
 	    read_status_reg(&lsm6dsl_i2c, LSM6DSL_REG_STATUS_REG, &status) < 0) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	update_counter(&drdy_state.gyro, (status & LSM6DSL_STATUS_GDA) != 0U, false);
+	k_mutex_unlock(&drdy_lock);
 }
 
 void sensor_drdy_poll_hts221(void)
@@ -177,47 +188,62 @@ void sensor_drdy_poll_hts221(void)
 	uint8_t status;
 	bool ready;
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	if (!drdy_state.initialized ||
 	    read_status_reg(&hts221_i2c, HTS221_REG_STATUS, &status) < 0) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	ready = (status & (HTS221_STATUS_H_DA | HTS221_STATUS_T_DA)) != 0U;
 	update_counter(&drdy_state.hts221, ready, false);
+	k_mutex_unlock(&drdy_lock);
 }
 
 void sensor_drdy_poll_lis3mdl(void)
 {
 	uint8_t status;
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	if (!drdy_state.initialized ||
 	    read_status_reg(&lis3mdl_i2c, LIS3MDL_REG_STATUS, &status) < 0) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	update_counter(&drdy_state.lis3mdl,
 		      (status & LIS3MDL_STATUS_ZYXDA) != 0U,
 		      (status & LIS3MDL_STATUS_ZYXOR) != 0U);
+	k_mutex_unlock(&drdy_lock);
 }
 
 void sensor_drdy_poll_lps22hb(void)
 {
 	uint8_t status;
 
+	k_mutex_lock(&drdy_lock, K_FOREVER);
 	if (!drdy_state.initialized ||
 	    read_status_reg(&lps22hb_i2c, LPS22HB_REG_STATUS, &status) < 0) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	update_counter(&drdy_state.lps22hb,
 		      (status & LPS22HB_STATUS_P_DA) != 0U,
 		      (status & LPS22HB_STATUS_P_OR) != 0U);
+	k_mutex_unlock(&drdy_lock);
 }
 
 bool sensor_drdy_report_ready(uint64_t now_us)
 {
-	return drdy_state.initialized &&
-	       (now_us - drdy_state.window_start_us) >= DRDY_WINDOW_US;
+	bool ready;
+
+	k_mutex_lock(&drdy_lock, K_FOREVER);
+	ready = drdy_state.initialized &&
+		(now_us - drdy_state.window_start_us) >= DRDY_WINDOW_US;
+	k_mutex_unlock(&drdy_lock);
+
+	return ready;
 }
 
 void sensor_drdy_format_report(char *buf, size_t buf_size, uint64_t now_us)
@@ -229,10 +255,14 @@ void sensor_drdy_format_report(char *buf, size_t buf_size, uint64_t now_us)
 	}
 
 	buf[0] = '\0';
-	if (!sensor_drdy_report_ready(now_us)) {
+	k_mutex_lock(&drdy_lock, K_FOREVER);
+	if (!drdy_state.initialized ||
+	    (now_us - drdy_state.window_start_us) < DRDY_WINDOW_US) {
+		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
+	/* Compact report format keeps UART output short enough for 1 Hz printing. */
 	drdy_append_fmt(buf, buf_size, &len, "drdy4s ");
 	append_counter(buf, buf_size, &len, "a", &drdy_state.accel, ACCEL_EXPECTED_PER_WINDOW,
 		      false);
@@ -260,4 +290,5 @@ void sensor_drdy_format_report(char *buf, size_t buf_size, uint64_t now_us)
 	(void)memset(&drdy_state.lis3mdl, 0, sizeof(drdy_state.lis3mdl));
 	(void)memset(&drdy_state.lps22hb, 0, sizeof(drdy_state.lps22hb));
 	drdy_state.window_start_us = now_us;
+	k_mutex_unlock(&drdy_lock);
 }
