@@ -3,9 +3,10 @@
 #include <zephyr/sys/printk.h>
 #include <string.h>
 
+#include "lsm6dsl_fifo.h"
 #include "sensor_drdy.h"
 
-static int read_accel(const struct device *dev, struct sensor_value accel[3])
+static int read_current_accel(const struct device *dev, struct sensor_value accel[3])
 {
 	int ret;
 
@@ -27,41 +28,73 @@ static int read_accel(const struct device *dev, struct sensor_value accel[3])
 	return 0;
 }
 
-void task_accel_sample(struct app_context *ctx, uint64_t timestamp_us, uint32_t late_us)
+static void enqueue_accel_sample(struct app_context *ctx, const struct accel_sample *sample)
 {
-	struct accel_sample sample = {
-		.timestamp_us = timestamp_us,
-		.late_us = late_us,
-	};
 	struct accel_sample dropped;
 
-	sensor_drdy_poll_accel();
-
-	if (read_accel(ctx->lsm6dsl_dev, sample.accel) != 0) {
-		return;
-	}
-
 	k_mutex_lock(&app_lock, K_FOREVER);
-	memcpy(ctx->accel, sample.accel, sizeof(ctx->accel));
-	if (late_us > 0U) {
+	memcpy(ctx->accel, sample->accel, sizeof(ctx->accel));
+	if (sample->late_us > 0U) {
 		ctx->accel_late_samples++;
-		if (late_us > ctx->accel_max_late_us) {
-			ctx->accel_max_late_us = late_us;
+		if (sample->late_us > ctx->accel_max_late_us) {
+			ctx->accel_max_late_us = sample->late_us;
 		}
 	}
 	k_mutex_unlock(&app_lock);
 
-	if (k_msgq_put(&accel_msgq, &sample, K_NO_WAIT) == 0) {
+	if (k_msgq_put(&accel_msgq, sample, K_NO_WAIT) == 0) {
 		return;
 	}
 
 	/* Cyclic buffering policy: make room by discarding the oldest sample. */
 	if (k_msgq_get(&accel_msgq, &dropped, K_NO_WAIT) == 0 &&
-	    k_msgq_put(&accel_msgq, &sample, K_NO_WAIT) == 0) {
+	    k_msgq_put(&accel_msgq, sample, K_NO_WAIT) == 0) {
 		k_mutex_lock(&app_lock, K_FOREVER);
 		ctx->accel_queue_drops++;
 		k_mutex_unlock(&app_lock);
 	}
+}
+
+void task_accel_sample(struct app_context *ctx, uint64_t timestamp_us, uint32_t late_us)
+{
+	uint16_t fifo_samples;
+
+	sensor_drdy_poll_accel();
+
+	if (lsm6dsl_fifo_sample_count(&fifo_samples) == 0 && fifo_samples > 0U) {
+		for (uint16_t i = 0U; i < fifo_samples; i++) {
+			uint64_t sample_age_us =
+				(uint64_t)(fifo_samples - 1U - i) * ACCEL_INTERVAL_BASE_US;
+			struct accel_sample sample = {
+				.timestamp_us = (timestamp_us > sample_age_us) ?
+						timestamp_us - sample_age_us : 0U,
+				.late_us = (i == 0U) ? late_us : 0U,
+			};
+
+			if (lsm6dsl_fifo_read_accel(sample.accel) < 0) {
+				return;
+			}
+
+			enqueue_accel_sample(ctx, &sample);
+		}
+
+		return;
+	}
+
+	/*
+	 * FIFO can be empty immediately after startup or if the thread wakes
+	 * before the next hardware sample. Fall back to the current output regs.
+	 */
+	struct accel_sample sample = {
+		.timestamp_us = timestamp_us,
+		.late_us = late_us,
+	};
+
+	if (read_current_accel(ctx->lsm6dsl_dev, sample.accel) != 0) {
+		return;
+	}
+
+	enqueue_accel_sample(ctx, &sample);
 }
 
 void task_read_hts221(struct app_context *ctx)

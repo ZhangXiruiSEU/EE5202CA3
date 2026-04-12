@@ -9,6 +9,7 @@
 #include "app_context.h"
 #include "app_threads.h"
 #include "har_task.h"
+#include "lsm6dsl_fifo.h"
 #include "sensor_drdy.h"
 
 static struct app_context app = {
@@ -76,6 +77,11 @@ int main(void)
 
 	if (sensor_drdy_init() < 0) {
 		printk("DRDY helper init failed.\n");
+		return 0;
+	}
+
+	if (lsm6dsl_fifo_init() < 0) {
+		printk("LSM6DSL FIFO init failed.\n");
 		return 0;
 	}
 
