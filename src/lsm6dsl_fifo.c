@@ -25,6 +25,14 @@
 
 static const struct i2c_dt_spec lsm6dsl_i2c = I2C_DT_SPEC_GET(DT_INST(0, st_lsm6dsl));
 
+/*
+ * Write one LSM6DSL register through I2C.
+ *
+ * This file talks to FIFO registers directly because Zephyr's generic sensor
+ * API does not expose a portable "drain all FIFO samples" call. The shared
+ * sensor_lock keeps these direct I2C transfers from racing Zephyr driver calls
+ * that access the same LSM6DSL device.
+ */
 static int fifo_reg_write(uint8_t reg, uint8_t value)
 {
 	int ret;
@@ -36,6 +44,13 @@ static int fifo_reg_write(uint8_t reg, uint8_t value)
 	return ret;
 }
 
+/*
+ * Read a consecutive register block from the LSM6DSL.
+ *
+ * FIFO status and FIFO data are both read as bursts. Reading FIFO_DATA_OUT_L
+ * advances the sensor's hardware FIFO read pointer, so callers must only call
+ * this when they intend to consume a sample.
+ */
 static int fifo_burst_read(uint8_t reg, uint8_t *buf, size_t len)
 {
 	int ret;
@@ -47,12 +62,25 @@ static int fifo_burst_read(uint8_t reg, uint8_t *buf, size_t len)
 	return ret;
 }
 
+/*
+ * Convert one raw LSM6DSL accel axis from FIFO format into Zephyr's
+ * sensor_value unit format. FIFO accel samples use the same raw scale as the
+ * normal accel output registers.
+ */
 static void raw_accel_to_sensor_value(int16_t raw, struct sensor_value *value)
 {
 	/* Default LSM6DSL accel full-scale is 2g: 61 ug/LSB in Zephyr's driver. */
 	sensor_ug_to_ms2((int64_t)raw * LSM6DSL_ACCEL_SENSITIVITY_UG_PER_LSB, value);
 }
 
+/*
+ * Configure the LSM6DSL hardware FIFO for this application.
+ *
+ * The FIFO is accel-only because HAR only consumes acceleration. It runs at
+ * the same 26 Hz rate as the accel sampling thread, so if the urgent thread
+ * blocks the CPU for one or more periods, the sensor can still collect samples
+ * internally until the accel thread gets CPU time again.
+ */
 int lsm6dsl_fifo_init(void)
 {
 	if (!i2c_is_ready_dt(&lsm6dsl_i2c)) {
@@ -67,16 +95,19 @@ int lsm6dsl_fifo_init(void)
 		return -EIO;
 	}
 
+	/* No explicit FIFO threshold; the accel thread polls and drains by count. */
 	if (fifo_reg_write(LSM6DSL_REG_FIFO_CTRL1, 0U) < 0 ||
 	    fifo_reg_write(LSM6DSL_REG_FIFO_CTRL2, 0U) < 0) {
 		return -EIO;
 	}
 
+	/* Store accel data in FIFO without decimation; do not store gyro data. */
 	if (fifo_reg_write(LSM6DSL_REG_FIFO_CTRL3,
 			   (LSM6DSL_FIFO_GY_DISABLE << 3) | LSM6DSL_FIFO_XL_NO_DEC) < 0) {
 		return -EIO;
 	}
 
+	/* Start FIFO stream mode at 26 Hz. */
 	if (fifo_reg_write(LSM6DSL_REG_FIFO_CTRL5,
 			   (LSM6DSL_FIFO_26HZ << 3) | LSM6DSL_FIFO_STREAM_MODE) < 0) {
 		return -EIO;
@@ -85,6 +116,12 @@ int lsm6dsl_fifo_init(void)
 	return 0;
 }
 
+/*
+ * Return how many complete accel samples are currently waiting in hardware FIFO.
+ *
+ * LSM6DSL reports FIFO level in 16-bit words. One accel sample is X/Y/Z, so it
+ * consumes three FIFO words. Any incomplete tail is ignored until the next poll.
+ */
 int lsm6dsl_fifo_sample_count(uint16_t *sample_count)
 {
 	uint8_t status[2];
@@ -100,6 +137,12 @@ int lsm6dsl_fifo_sample_count(uint16_t *sample_count)
 	return 0;
 }
 
+/*
+ * Consume one accel sample from the LSM6DSL hardware FIFO.
+ *
+ * Each sample is 6 bytes: little-endian signed 16-bit X, Y, and Z. Calling this
+ * repeatedly drains older samples first.
+ */
 int lsm6dsl_fifo_read_accel(struct sensor_value accel[3])
 {
 	uint8_t raw[6];
