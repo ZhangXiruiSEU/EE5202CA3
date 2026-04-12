@@ -47,6 +47,13 @@
 /* Default +-2g accel sensitivity from the LSM6DSL driver: 61 micro-g per LSB. */
 #define LSM6DSL_ACCEL_SENSITIVITY_UG_PER_LSB 61LL
 
+/*
+ * Low-level I2C handle for the LSM6DSL devicetree node.
+ *
+ * DEVICE_DT_GET_ONE(st_lsm6dsl) gives the Zephyr sensor driver object used by
+ * sensor_sample_fetch(). This i2c_dt_spec instead stores the I2C bus device and
+ * slave address, which we need for direct FIFO register reads/writes.
+ */
 static const struct i2c_dt_spec lsm6dsl_i2c = I2C_DT_SPEC_GET(DT_INST(0, st_lsm6dsl));
 
 /*
