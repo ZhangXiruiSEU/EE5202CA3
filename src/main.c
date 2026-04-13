@@ -16,9 +16,20 @@
 #include "HARnet/network.h"
 #include "sensor_drdy.h"
 
+/* One scheduling reference window: 4 seconds expressed in microseconds. */
 #define MAJOR_CYCLE_US 4000000ULL
+/* Target accelerometer cadence: exactly 104 samples in each 4-second window. */
 #define ACCEL_EVENTS_PER_MAJOR 104U
+/*
+ * Integer part of the accel interval:
+ *   4,000,000 us / 104 = 38,461 us remainder 56.
+ */
 #define ACCEL_INTERVAL_BASE_US (MAJOR_CYCLE_US / ACCEL_EVENTS_PER_MAJOR)
+/*
+ * Fractional part of the accel interval, kept as a remainder instead of using
+ * floating point. The scheduler accumulates this value and converts every 104
+ * remainder units into one extra microsecond.
+ */
 #define ACCEL_INTERVAL_REM_US (MAJOR_CYCLE_US % ACCEL_EVENTS_PER_MAJOR)
 #define GYRO_PERIOD_US 80000ULL
 #define MAG_PERIOD_US 800000ULL
@@ -36,6 +47,13 @@
 #define HAR_AXES 3
 #define HAR_INPUT_SCALE_MG 4000.0f
 
+/*
+ * Shared application state.
+ *
+ * Sensor tasks update the latest reading in this structure. The print task then
+ * formats those cached values, so each sensor can run at its own rate without
+ * forcing every output line to fetch every sensor again.
+ */
 struct app_context {
 	const struct device *lsm6dsl_dev;
 	const struct device *hts221_dev;
@@ -55,6 +73,14 @@ struct app_context {
 
 typedef void (*scheduler_task_fn)(struct app_context *ctx);
 
+/*
+ * Small cooperative scheduler entry.
+ *
+ * Each task owns a period and the absolute uptime when it should run next. The
+ * main loop sleeps until the earliest release time, runs all due tasks, then
+ * advances each task by whole periods so a delayed iteration does not execute a
+ * burst of stale releases.
+ */
 struct scheduler_task {
 	uint64_t period_us;
 	uint64_t next_release_us;
@@ -70,6 +96,11 @@ static char status_msg[STATUS_MSG_SIZE];
 static char drdy_msg[192];
 static size_t har_count;
 static size_t har_write_index;
+/*
+ * Device pointers are resolved from devicetree at build time. main() still
+ * checks device_is_ready() before using them because probe or bus setup can
+ * fail at runtime.
+ */
 static struct app_context app = {
 	.lsm6dsl_dev = DEVICE_DT_GET_ONE(st_lsm6dsl),
 	.hts221_dev = DEVICE_DT_GET_ONE(st_hts221),
@@ -92,6 +123,21 @@ static void append_fmt(char *buf, size_t buf_size, size_t *offset, const char *f
 
 static void accel_schedule_advance(uint64_t *next_accel_us, uint32_t *accel_remainder_accum)
 {
+	/*
+	 * Advance the next accelerometer release by the exact average interval
+	 * without using floating point time.
+	 *
+	 * Desired interval:
+	 *   4,000,000 us / 104 = 38,461.538461... us
+	 *
+	 * Integer scheduling cannot represent the .538461... us fraction directly,
+	 * so each call adds 38,461 us and stores the dropped remainder, 56/104 us,
+	 * in accel_remainder_accum. Whenever the accumulated remainder reaches 104,
+	 * that represents one whole microsecond and is added back to next_accel_us.
+	 *
+	 * This makes individual intervals alternate between 38,461 us and 38,462 us,
+	 * while every 104 intervals still add up to exactly 4,000,000 us.
+	 */
 	*next_accel_us += ACCEL_INTERVAL_BASE_US;
 	*accel_remainder_accum += ACCEL_INTERVAL_REM_US;
 	if (*accel_remainder_accum >= ACCEL_EVENTS_PER_MAJOR) {
@@ -160,6 +206,7 @@ static void append_score(char *buf, size_t buf_size, size_t *offset, float value
 
 static float accel_to_model_input(const struct sensor_value *accel)
 {
+	/* Convert Zephyr's m/s^2 value to mg, then scale to the model input range. */
 	return (float)sensor_ms2_to_mg(accel) / HAR_INPUT_SCALE_MG;
 }
 
@@ -185,6 +232,10 @@ static void task_read_hts221(struct app_context *ctx)
 {
 	int ret;
 
+	/*
+	 * Poll the raw DRDY bit before fetching the sample. The fetch call may
+	 * clear or consume data-ready state depending on the driver or sensor.
+	 */
 	sensor_drdy_poll_hts221();
 
 	ret = sensor_sample_fetch(ctx->hts221_dev);
@@ -209,6 +260,7 @@ static void task_read_gyro(struct app_context *ctx)
 {
 	int ret;
 
+	/* Record whether the gyro had new data available at this scheduled slot. */
 	sensor_drdy_poll_gyro();
 
 	ret = sensor_sample_fetch_chan(ctx->lsm6dsl_dev, SENSOR_CHAN_GYRO_XYZ);
@@ -227,6 +279,7 @@ static void task_read_lis3mdl(struct app_context *ctx)
 {
 	int ret;
 
+	/* LIS3MDL exposes both data-ready and overrun bits; both are tracked. */
 	sensor_drdy_poll_lis3mdl();
 
 	ret = sensor_sample_fetch(ctx->lis3mdl_dev);
@@ -245,6 +298,7 @@ static void task_read_lps22hb(struct app_context *ctx)
 {
 	int ret;
 
+	/* LPS22HB pressure DRDY/overrun status is sampled before the driver fetch. */
 	sensor_drdy_poll_lps22hb();
 
 	ret = sensor_sample_fetch(ctx->lps22hb_dev);
@@ -268,6 +322,10 @@ static int har_init(void)
 	stai_size n_inputs;
 	stai_size n_outputs;
 
+	/*
+	 * The generated HAR network owns static metadata, while this file provides
+	 * the runtime context and activation memory required by ST AI.
+	 */
 	rc = stai_network_init(har_network_ctx);
 	if (rc != STAI_SUCCESS) {
 		printk("HAR init failed: 0x%x\n", rc);
@@ -306,6 +364,11 @@ static bool har_push_sample(const struct sensor_value accel[3])
 		accel_to_model_input(&accel[2]),
 	};
 
+	/*
+	 * Keep the latest HAR_WINDOW_SAMPLES acceleration samples in a ring buffer.
+	 * har_write_index always points to the slot that will be overwritten next;
+	 * once the buffer is full, that slot is also the oldest sample.
+	 */
 	memcpy(har_window[har_write_index], sample, sizeof(sample));
 	har_write_index = (har_write_index + 1U) % HAR_WINDOW_SAMPLES;
 
@@ -318,6 +381,7 @@ static bool har_push_sample(const struct sensor_value accel[3])
 
 static void task_accel_sample(struct app_context *ctx)
 {
+	/* Accel is the timing source for the HAR input window. */
 	sensor_drdy_poll_accel();
 
 	if (read_accel(ctx->lsm6dsl_dev, ctx->accel) == 0) {
@@ -334,16 +398,22 @@ static int har_run_inference_cached(struct app_context *ctx)
 	uint64_t elapsed_us;
 
 	if (har_count < HAR_WINDOW_SAMPLES) {
+		/* Not enough samples yet for one full model window. */
 		ctx->har_status = 1;
 		return 1;
 	}
 
+	/*
+	 * Copy the ring buffer into the model input in chronological order:
+	 * oldest sample first, newest sample last.
+	 */
 	for (size_t i = 0; i < HAR_WINDOW_SAMPLES; i++) {
 		size_t src_index = (har_write_index + i) % HAR_WINDOW_SAMPLES;
 
 		memcpy(&har_input[i * HAR_AXES], har_window[src_index], sizeof(har_window[0]));
 	}
 
+	/* Measure synchronous inference latency in both CPU cycles and microseconds. */
 	start_cycles = k_cycle_get_32();
 	rc = stai_network_run(har_network_ctx, STAI_MODE_SYNC);
 	end_cycles = k_cycle_get_32();
@@ -373,6 +443,11 @@ static void task_print_status(struct app_context *ctx)
 {
 	size_t len = 0;
 
+	/*
+	 * Every 4 seconds the DRDY helper emits a compact health report and resets
+	 * its counters. That report takes priority over the regular sensor line so
+	 * the UART output remains bounded.
+	 */
 	sensor_drdy_format_report(drdy_msg, sizeof(drdy_msg), now_us());
 	if (drdy_msg[0] != '\0') {
 		printk("%s", drdy_msg);
@@ -430,6 +505,11 @@ static void task_print_status(struct app_context *ctx)
 
 static void scheduler_init(struct scheduler_task *tasks, uint64_t start_us)
 {
+	/*
+	 * Stagger low-rate tasks inside each one-second frame. This spreads I2C
+	 * traffic, HAR inference, and UART formatting instead of doing them all at
+	 * the same instant.
+	 */
 	tasks[0].period_us = GYRO_PERIOD_US;
 	tasks[0].next_release_us = start_us;
 	tasks[0].run = task_read_gyro;
@@ -476,12 +556,23 @@ static void scheduler_run_strict(struct app_context *ctx)
 
 	scheduler_init(scheduler_tasks, next_accel_us);
 
+	/*
+	 * Single-thread cooperative scheduler:
+	 * - keep an absolute "next release" timestamp for each task;
+	 * - sleep until the earliest pending release;
+	 * - run every task that is due;
+	 * - advance missed releases to the next future slot instead of backfilling.
+	 *
+	 * This keeps task phases stable over long runs. Accel sampling is scheduled
+	 * separately because its exact period is fractional in microseconds.
+	 */
 	while (1) {
 		uint64_t current_us = now_us();
 		uint64_t next_wakeup_us = scheduler_next_wakeup(scheduler_tasks,
 						 ARRAY_SIZE(scheduler_tasks),
 						 next_accel_us);
 
+		/* Sleep until the next scheduled release instead of busy waiting. */
 		if (current_us < next_wakeup_us) {
 			uint64_t sleep_us = next_wakeup_us - current_us;
 
@@ -491,12 +582,19 @@ static void scheduler_run_strict(struct app_context *ctx)
 
 		if (current_us >= next_accel_us) {
 			task_accel_sample(ctx);
-			accel_schedule_advance(&next_accel_us, &accel_remainder_accum);
+			do {
+				accel_schedule_advance(&next_accel_us, &accel_remainder_accum);
+			} while (current_us >= next_accel_us);
 		}
 
 		for (size_t i = 0; i < ARRAY_SIZE(scheduler_tasks); i++) {
+			current_us = now_us();
 			if (current_us >= scheduler_tasks[i].next_release_us) {
 				scheduler_tasks[i].run(ctx);
+				/*
+				 * Skip stale releases and keep the task aligned to its
+				 * original time grid rather than current_us + period.
+				 */
 				do {
 					scheduler_tasks[i].next_release_us += scheduler_tasks[i].period_us;
 				} while (current_us >= scheduler_tasks[i].next_release_us);
@@ -510,17 +608,24 @@ int main(void)
 	struct sensor_value accel_odr_attr = { .val1 = 26, .val2 = 0 };
 	struct sensor_value gyro_odr_attr = { .val1 = 12, .val2 = 0 };
 
+	/* The LSM6DSL provides both accelerometer and gyro channels. */
 	if (!device_is_ready(app.lsm6dsl_dev)) {
 		printk("sensor: device not ready.\n");
 		return 0;
 	}
 
+	/* Auxiliary sensors are required for the full status output. */
 	if (!device_is_ready(app.hts221_dev) || !device_is_ready(app.lis3mdl_dev) ||
 	    !device_is_ready(app.lps22hb_dev)) {
 		printk("aux sensor: device not ready.\n");
 		return 0;
 	}
 
+	/*
+	 * Configure the physical LSM6DSL output data rates. The software scheduler
+	 * then reads at matching or lower rates and uses DRDY counters to detect
+	 * missed or duplicate samples.
+	 */
 	if (sensor_attr_set(app.lsm6dsl_dev, SENSOR_CHAN_ACCEL_XYZ,
 			    SENSOR_ATTR_SAMPLING_FREQUENCY, &accel_odr_attr) < 0) {
 		printk("Cannot set sampling frequency for accelerometer.\n");
@@ -543,6 +648,7 @@ int main(void)
 	}
 
 	printk("HAR window: %d x %d accel samples\n", HAR_WINDOW_SAMPLES, HAR_AXES);
+	/* Does not return during normal operation. */
 	scheduler_run_strict(&app);
 	return 0;
 }
