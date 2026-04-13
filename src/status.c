@@ -9,9 +9,9 @@ static char status_msg[STATUS_MSG_SIZE];
 static char drdy_msg[192];
 
 static const char *const har_labels[3] = {
-	"running",
-	"walking",
 	"stationary",
+	"walking",
+	"running",
 };
 
 static void append_fmt(char *buf, size_t buf_size, size_t *offset, const char *fmt, ...)
