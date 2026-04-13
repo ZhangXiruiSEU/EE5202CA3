@@ -200,7 +200,7 @@ Meaning:
 
 | Field | Meaning |
 | --- | --- |
-| `qdrop` | Count of accel queue drops. `0` means HAR has kept up with accel queue consumption. |
+| `qdrop` | Number of accel samples dropped because `accel_msgq` was full. `0` means no accepted accel sample was pushed out of the software queue before HAR could consume it. |
 | `late` | Cumulative number of accel thread wakeups that occurred after their planned time. Even tiny lateness increments this. |
 | `maxlate` | Largest observed accel scheduling lateness in microseconds. |
 | `urgent=A/B` | `A` is urgent thread event count; `B` is the most recent urgent busy-wait duration in microseconds. |
