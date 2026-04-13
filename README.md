@@ -22,73 +22,6 @@ the basic hardware interface layer for I2C, SPI, UART, clocks, GPIO routing, or
 the onboard sensor descriptions. Those are provided by Zephyr's board
 definition and devicetree files.
 
-For example, Zephyr's board file:
-
-```text
-zephyr/boards/st/disco_l475_iot1/disco_l475_iot1.dts
-```
-
-contains the board model, console choice, I2C pin routing, and onboard sensor
-nodes. A shortened excerpt is:
-
-```dts
-/ {
-	model = "STMicroelectronics B-L475E-IOT01Ax board";
-	compatible = "st,stm32l475-disco-iot";
-
-	chosen {
-		zephyr,console = &usart1;
-		zephyr,sram = &sram0;
-		zephyr,flash = &flash0;
-	};
-
-	aliases {
-		accel0 = &lsm6dsl;
-	};
-};
-
-&i2c2 {
-	pinctrl-0 = <&i2c2_scl_pb10 &i2c2_sda_pb11>;
-	pinctrl-names = "default";
-	status = "okay";
-	clock-frequency = <I2C_BITRATE_FAST>;
-
-	lis3mdl-magn@1e {
-		compatible = "st,lis3mdl-magn";
-		reg = <0x1e>;
-	};
-
-	hts221@5f {
-		compatible = "st,hts221";
-		reg = <0x5f>;
-		drdy-gpios = <&gpiod 15 GPIO_ACTIVE_HIGH>;
-	};
-
-	lps22hb-press@5d {
-		compatible = "st,lps22hb-press";
-		reg = <0x5d>;
-	};
-
-	lsm6dsl: lsm6dsl@6a {
-		compatible = "st,lsm6dsl";
-		reg = <0x6a>;
-		irq-gpios = <&gpiod 11 GPIO_ACTIVE_HIGH>;
-	};
-};
-```
-
-This is the concrete reason the application can write:
-
-```c
-DEVICE_DT_GET_ONE(st_lsm6dsl)
-DEVICE_DT_GET_ONE(st_hts221)
-DEVICE_DT_GET_ONE(st_lis3mdl_magn)
-DEVICE_DT_GET_ONE(st_lps22hb_press)
-```
-
-instead of manually defining I2C addresses, pins, and HAL handles in application
-code.
-
 ## Development Environment
 
 This project assumes a Zephyr command-line workspace rather than a standalone
@@ -127,35 +60,16 @@ From the application directory:
 cd ~/zephyrproject/applications/lsm6dsl
 ```
 
-Clean build with `west`:
+Build with `west`:
 
 ```sh
 west build -b disco_l475_iot1
-```
-
-Incremental rebuild after code changes:
-
-```sh
-west build
-```
-
-If a completely fresh CMake configuration is needed:
-
-```sh
-west build -p always -b disco_l475_iot1
 ```
 
 Flash to the connected board:
 
 ```sh
 west flash
-```
-
-If the board runner needs to be selected explicitly, use the runner supported by
-the local Zephyr board configuration, for example:
-
-```sh
-west flash --runner openocd
 ```
 
 ## Build System
@@ -174,8 +88,6 @@ Core/Inc/main.h
 Drivers/STM32xxxx_HAL_Driver
 Drivers/CMSIS
 ```
-
-
 
 ### This Project
 
@@ -319,6 +231,73 @@ HAL_SPI_TransmitReceive(...);
 Or through ST BSP sensor wrappers if available.
 
 ### This Project
+
+Zephyr's board devicetree describes the onboard sensors and their bus
+connections. For this board, the relevant file is:
+
+```text
+zephyr/boards/st/disco_l475_iot1/disco_l475_iot1.dts
+```
+
+A shortened excerpt is:
+
+```dts
+/ {
+	model = "STMicroelectronics B-L475E-IOT01Ax board";
+	compatible = "st,stm32l475-disco-iot";
+
+	chosen {
+		zephyr,console = &usart1;
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+	};
+
+	aliases {
+		accel0 = &lsm6dsl;
+	};
+};
+
+&i2c2 {
+	pinctrl-0 = <&i2c2_scl_pb10 &i2c2_sda_pb11>;
+	pinctrl-names = "default";
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	lis3mdl-magn@1e {
+		compatible = "st,lis3mdl-magn";
+		reg = <0x1e>;
+	};
+
+	hts221@5f {
+		compatible = "st,hts221";
+		reg = <0x5f>;
+		drdy-gpios = <&gpiod 15 GPIO_ACTIVE_HIGH>;
+	};
+
+	lps22hb-press@5d {
+		compatible = "st,lps22hb-press";
+		reg = <0x5d>;
+	};
+
+	lsm6dsl: lsm6dsl@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		irq-gpios = <&gpiod 11 GPIO_ACTIVE_HIGH>;
+	};
+};
+```
+
+This is why the application can get sensor device objects by compatible name:
+
+```c
+DEVICE_DT_GET_ONE(st_lsm6dsl)
+DEVICE_DT_GET_ONE(st_hts221)
+DEVICE_DT_GET_ONE(st_lis3mdl_magn)
+DEVICE_DT_GET_ONE(st_lps22hb_press)
+```
+
+instead of manually defining I2C addresses, pins, and HAL handles in application
+code.
 
 Most sensor reads use Zephyr's generic sensor API:
 
