@@ -31,21 +31,16 @@
  * remainder units into one extra microsecond.
  */
 #define ACCEL_INTERVAL_REM_US (MAJOR_CYCLE_US % ACCEL_EVENTS_PER_MAJOR)
-#define GYRO_PERIOD_US 80000ULL
-#define MAG_PERIOD_US 800000ULL
-#define ENV_PERIOD_US 1000000ULL
-#define HAR_PERIOD_US 1000000ULL
-#define PRINT_PERIOD_US 1000000ULL
-#define UART_BAUD_RATE 115200ULL
 #define STATUS_MSG_SIZE 384
-#define HTS221_PHASE_US 200000ULL
-#define LPS22HB_PHASE_US 400000ULL
-#define LIS3MDL_PHASE_US 600000ULL
-#define HAR_PHASE_US 900000ULL
-#define PRINT_PHASE_US 950000ULL
 #define HAR_WINDOW_SAMPLES 26
 #define HAR_AXES 3
 #define HAR_INPUT_SCALE_MG 4000.0f
+/*
+ * Do not start a lower-priority task when the next accel sample is this close.
+ * The accel path feeds the HAR window, so it gets priority over status sensors,
+ * inference, and UART printing in the cooperative scheduler.
+ */
+#define ACCEL_GUARD_US 3000ULL
 
 /*
  * Shared application state.
@@ -74,16 +69,11 @@ struct app_context {
 typedef void (*scheduler_task_fn)(struct app_context *ctx);
 
 /*
- * Small cooperative scheduler entry.
- *
- * Each task owns a period and the absolute uptime when it should run next. The
- * main loop sleeps until the earliest release time, runs all due tasks, then
- * advances each task by whole periods so a delayed iteration does not execute a
- * burst of stale releases.
+ * One ordinary-task release inside the explicit 4-second schedule.
+ * offset_us is relative to the start of the current major cycle.
  */
-struct scheduler_task {
-	uint64_t period_us;
-	uint64_t next_release_us;
+struct scheduler_event {
+	uint64_t offset_us;
 	scheduler_task_fn run;
 };
 
@@ -107,7 +97,6 @@ static struct app_context app = {
 	.lis3mdl_dev = DEVICE_DT_GET_ONE(st_lis3mdl_magn),
 	.lps22hb_dev = DEVICE_DT_GET_ONE(st_lps22hb_press),
 };
-static struct scheduler_task scheduler_tasks[6];
 
 static uint64_t now_us(void)
 {
@@ -503,74 +492,123 @@ static void task_print_status(struct app_context *ctx)
 	printk("%s", status_msg);
 }
 
-static void scheduler_init(struct scheduler_task *tasks, uint64_t start_us)
+/*
+ * Explicit 4-second ordinary-task schedule.
+ *
+ * These releases are placed inside accel gaps instead of using independent
+ * fixed periods. Gyro still runs 50 times per 4-second major cycle on average,
+ * but individual gyro gaps are allowed to vary so they can avoid accel samples
+ * and longer HAR / UART windows.
+ */
+static const struct scheduler_event scheduler_events[] = {
+	{ 57692ULL, task_read_gyro },
+	{ 134615ULL, task_read_gyro },
+	{ 211538ULL, task_read_gyro },
+	{ 249999ULL, task_read_hts221 },
+	{ 288461ULL, task_read_gyro },
+	{ 365384ULL, task_read_gyro },
+	{ 403845ULL, task_read_lis3mdl },
+	{ 442307ULL, task_read_lps22hb },
+	{ 480769ULL, task_read_gyro },
+	{ 519230ULL, task_read_gyro },
+	{ 596153ULL, task_read_gyro },
+	{ 673076ULL, task_read_gyro },
+	{ 749999ULL, task_read_gyro },
+	{ 826922ULL, task_read_gyro },
+	{ 865384ULL, task_read_gyro },
+	{ 901345ULL, task_run_har_measure },
+	{ 934807ULL, task_print_status },
+	{ 1019230ULL, task_read_gyro },
+	{ 1096153ULL, task_read_gyro },
+	{ 1173076ULL, task_read_gyro },
+	{ 1211538ULL, task_read_lis3mdl },
+	{ 1249999ULL, task_read_hts221 },
+	{ 1288461ULL, task_read_gyro },
+	{ 1326922ULL, task_read_gyro },
+	{ 1403845ULL, task_read_gyro },
+	{ 1442307ULL, task_read_lps22hb },
+	{ 1480769ULL, task_read_gyro },
+	{ 1557692ULL, task_read_gyro },
+	{ 1634615ULL, task_read_gyro },
+	{ 1711538ULL, task_read_gyro },
+	{ 1788461ULL, task_read_gyro },
+	{ 1865384ULL, task_read_gyro },
+	{ 1901345ULL, task_run_har_measure },
+	{ 1934807ULL, task_print_status },
+	{ 1980769ULL, task_read_gyro },
+	{ 2019230ULL, task_read_lis3mdl },
+	{ 2057692ULL, task_read_gyro },
+	{ 2134615ULL, task_read_gyro },
+	{ 2211538ULL, task_read_gyro },
+	{ 2249999ULL, task_read_hts221 },
+	{ 2288461ULL, task_read_gyro },
+	{ 2365384ULL, task_read_gyro },
+	{ 2403845ULL, task_read_gyro },
+	{ 2442307ULL, task_read_lps22hb },
+	{ 2519230ULL, task_read_gyro },
+	{ 2596153ULL, task_read_gyro },
+	{ 2673076ULL, task_read_gyro },
+	{ 2749999ULL, task_read_gyro },
+	{ 2826922ULL, task_read_lis3mdl },
+	{ 2865384ULL, task_read_gyro },
+	{ 2901345ULL, task_run_har_measure },
+	{ 2934807ULL, task_print_status },
+	{ 2980769ULL, task_read_gyro },
+	{ 3019230ULL, task_read_gyro },
+	{ 3096153ULL, task_read_gyro },
+	{ 3173076ULL, task_read_gyro },
+	{ 3211538ULL, task_read_gyro },
+	{ 3249999ULL, task_read_hts221 },
+	{ 3326922ULL, task_read_gyro },
+	{ 3403845ULL, task_read_gyro },
+	{ 3442307ULL, task_read_lps22hb },
+	{ 3480769ULL, task_read_gyro },
+	{ 3557692ULL, task_read_gyro },
+	{ 3634615ULL, task_read_lis3mdl },
+	{ 3673076ULL, task_read_gyro },
+	{ 3711538ULL, task_read_gyro },
+	{ 3788461ULL, task_read_gyro },
+	{ 3865384ULL, task_read_gyro },
+	{ 3901345ULL, task_run_har_measure },
+	{ 3934807ULL, task_print_status },
+	{ 3980769ULL, task_read_gyro },
+};
+
+static uint64_t scheduler_event_release_us(uint64_t cycle_start_us, size_t event_index)
 {
-	/*
-	 * Stagger low-rate tasks inside each one-second frame. This spreads I2C
-	 * traffic, HAR inference, and UART formatting instead of doing them all at
-	 * the same instant.
-	 */
-	tasks[0].period_us = GYRO_PERIOD_US;
-	tasks[0].next_release_us = start_us;
-	tasks[0].run = task_read_gyro;
-
-	tasks[1].period_us = ENV_PERIOD_US;
-	tasks[1].next_release_us = start_us + HTS221_PHASE_US;
-	tasks[1].run = task_read_hts221;
-
-	tasks[2].period_us = MAG_PERIOD_US;
-	tasks[2].next_release_us = start_us + LIS3MDL_PHASE_US;
-	tasks[2].run = task_read_lis3mdl;
-
-	tasks[3].period_us = ENV_PERIOD_US;
-	tasks[3].next_release_us = start_us + LPS22HB_PHASE_US;
-	tasks[3].run = task_read_lps22hb;
-
-	tasks[4].period_us = HAR_PERIOD_US;
-	tasks[4].next_release_us = start_us + HAR_PHASE_US;
-	tasks[4].run = task_run_har_measure;
-
-	tasks[5].period_us = PRINT_PERIOD_US;
-	tasks[5].next_release_us = start_us + PRINT_PHASE_US;
-	tasks[5].run = task_print_status;
+	return cycle_start_us + scheduler_events[event_index].offset_us;
 }
 
-static uint64_t scheduler_next_wakeup(const struct scheduler_task *tasks, size_t task_count,
-				      uint64_t next_accel_us)
+static void scheduler_event_advance(uint64_t *cycle_start_us, size_t *event_index)
 {
-	uint64_t next_wakeup_us = next_accel_us;
-
-	for (size_t i = 0; i < task_count; i++) {
-		if (tasks[i].next_release_us < next_wakeup_us) {
-			next_wakeup_us = tasks[i].next_release_us;
-		}
+	(*event_index)++;
+	if (*event_index >= ARRAY_SIZE(scheduler_events)) {
+		*event_index = 0;
+		*cycle_start_us += MAJOR_CYCLE_US;
 	}
-
-	return next_wakeup_us;
 }
 
 static void scheduler_run_strict(struct app_context *ctx)
 {
 	uint64_t next_accel_us = now_us();
 	uint32_t accel_remainder_accum = 0;
-
-	scheduler_init(scheduler_tasks, next_accel_us);
+	uint64_t event_cycle_start_us = next_accel_us;
+	size_t event_index = 0;
 
 	/*
 	 * Single-thread cooperative scheduler:
-	 * - keep an absolute "next release" timestamp for each task;
-	 * - sleep until the earliest pending release;
-	 * - run every task that is due;
-	 * - advance missed releases to the next future slot instead of backfilling.
+	 * - accel uses its exact 104-samples-per-4s release track;
+	 * - other work follows the explicit 4-second scheduler_events[] table;
+	 * - sleep until the next accel or ordinary-task release;
+	 * - run due work, then advance each release to its next planned slot.
 	 *
 	 * This keeps task phases stable over long runs. Accel sampling is scheduled
 	 * separately because its exact period is fractional in microseconds.
 	 */
 	while (1) {
 		uint64_t current_us = now_us();
-		uint64_t next_wakeup_us = scheduler_next_wakeup(scheduler_tasks,
-						 ARRAY_SIZE(scheduler_tasks),
-						 next_accel_us);
+		uint64_t next_event_us = scheduler_event_release_us(event_cycle_start_us, event_index);
+		uint64_t next_wakeup_us = MIN(next_accel_us, next_event_us);
 
 		/* Sleep until the next scheduled release instead of busy waiting. */
 		if (current_us < next_wakeup_us) {
@@ -587,18 +625,20 @@ static void scheduler_run_strict(struct app_context *ctx)
 			} while (current_us >= next_accel_us);
 		}
 
-		for (size_t i = 0; i < ARRAY_SIZE(scheduler_tasks); i++) {
+		while (1) {
 			current_us = now_us();
-			if (current_us >= scheduler_tasks[i].next_release_us) {
-				scheduler_tasks[i].run(ctx);
-				/*
-				 * Skip stale releases and keep the task aligned to its
-				 * original time grid rather than current_us + period.
-				 */
-				do {
-					scheduler_tasks[i].next_release_us += scheduler_tasks[i].period_us;
-				} while (current_us >= scheduler_tasks[i].next_release_us);
+			if (current_us < next_accel_us &&
+			    (next_accel_us - current_us) <= ACCEL_GUARD_US) {
+				break;
 			}
+
+			next_event_us = scheduler_event_release_us(event_cycle_start_us, event_index);
+			if (current_us < next_event_us) {
+				break;
+			}
+
+			scheduler_events[event_index].run(ctx);
+			scheduler_event_advance(&event_cycle_start_us, &event_index);
 		}
 	}
 }

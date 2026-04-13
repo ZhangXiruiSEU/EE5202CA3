@@ -43,32 +43,33 @@ grid.
 
 - accelerometer: exact `26 Hz` pacing via a fractional interval accumulator
   over a `4 s` major cycle
-- gyroscope: every `80 ms`
-- magnetometer: every `800 ms`
-- HTS221: every `1000 ms`
-- LPS22HB: every `1000 ms`
-- HAR inference: every `1000 ms`
-- UART print: every `1000 ms`
+- gyroscope: `50` planned releases per `4 s` major cycle
+- magnetometer: `5` planned releases per `4 s` major cycle
+- HTS221: `4` planned releases per `4 s` major cycle
+- LPS22HB: `4` planned releases per `4 s` major cycle
+- HAR inference: `4` planned releases per `4 s` major cycle
+- UART print: `4` planned releases per `4 s` major cycle
 
-### Phase offsets
+### Ordinary-task table
 
-The low-rate tasks are intentionally staggered to avoid piling them all into the
-same moment:
+Ordinary tasks use an explicit 4-second release table in `src/main.c` instead
+of independent fixed periods. This keeps the average rates the same while
+placing each release inside an accelerometer gap.
 
-| Task | Period | Phase Offset |
-| --- | --- | --- |
-| Accelerometer | about 38.46 ms | 0 ms |
-| Gyroscope | 80 ms | 0 ms |
-| HTS221 | 1000 ms | 200 ms |
-| LPS22HB | 1000 ms | 400 ms |
-| LIS3MDL | 800 ms | 600 ms |
-| HAR inference | 1000 ms | 900 ms |
-| UART print | 1000 ms | 950 ms |
+| Task | Releases per 4 s | Placement |
+| --- | ---: | --- |
+| Accelerometer | 104 | Fractional 26 Hz accumulator |
+| Gyroscope | 50 | Midpoints of selected accel gaps |
+| HTS221 | 4 | Midpoints of selected accel gaps |
+| LPS22HB | 4 | Midpoints of selected accel gaps |
+| LIS3MDL | 5 | Midpoints of selected accel gaps |
+| HAR inference | 4 | Centered in accel gaps with about 5 ms reserved |
+| UART print | 4 | Centered in accel gaps with about 15 ms reserved |
 
 This places the UART print after the HAR run so the status message contains the
-latest classification result and inference time. The larger HAR-to-UART gap and
-the earlier UART phase also leave more room before the next 1 s boundary if the
-UART print blocks longer than expected.
+latest classification result and inference time. HAR is planned as an about
+`5 ms` task, and UART print is planned as an about `15 ms` task; both are placed
+inside accel gaps with margin before the next accel release.
 
 The accelerometer entry starts at `0 ms`, but unlike the other tasks it is not
 released by a fixed integer period. It uses a fractional interval accumulator
