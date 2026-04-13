@@ -5,7 +5,10 @@
 
 The application now uses multiple Zephyr threads instead of one cyclic
 superloop. Sensor acquisition, HAR inference, status printing, and the
- urgent load are separated into their own kernel threads.
+urgent load are separated into their own kernel threads.
+
+For more background on how this Zephyr-based project differs from the default
+STM32CubeIDE workflow, as well as the development environment construction, see the ***Appendix A - Zephyr vs STM32Cube IDE***.
 
 ## Current Thread Model
 

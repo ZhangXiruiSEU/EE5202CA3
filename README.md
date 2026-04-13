@@ -1,4 +1,4 @@
-# Zephyr vs STM32CubeIDE In This Project
+# Appendix A - Zephyr vs STM32Cube IDE
 
 This assignment is commonly done with STM32CubeIDE, STM32CubeMX, HAL drivers,
 and generated `Core/Src/main.c` / `Core/Inc` project structure. This project
