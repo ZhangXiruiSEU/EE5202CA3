@@ -1,4 +1,6 @@
 /build/
 /.cache/
 /for_assignment/
+/README.rst
+/sample.yaml
 **/.DS_Store
