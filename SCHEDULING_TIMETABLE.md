@@ -15,11 +15,18 @@ Use this as a manual planning sheet when adjusting task phase offsets.
 | Accel base interval | `ACCEL_INTERVAL_BASE_US` | `38,461 us` |
 | Accel interval remainder | `ACCEL_INTERVAL_REM_US` | `56` |
 | Accel guard before low-priority tasks | `ACCEL_GUARD_US` | `3,000 us` |
-| Ordinary-task schedule | `scheduler_events[]` | explicit 4-second table |
-| Gyro releases | `task_read_gyro` | `50` per 4 seconds |
-| HTS221 releases | `task_read_hts221` | `4` per 4 seconds |
-| LPS22HB releases | `task_read_lps22hb` | `4` per 4 seconds |
-| LIS3MDL releases | `task_read_lis3mdl` | `5` per 4 seconds |
+| Gyro period | `GYRO_PERIOD_US` | `80,000 us` |
+| HTS221 period | `ENV_PERIOD_US` | `1,000,000 us` |
+| LPS22HB period | `ENV_PERIOD_US` | `1,000,000 us` |
+| LIS3MDL period | `MAG_PERIOD_US` | `800,000 us` |
+| HTS221 phase | `HTS221_PHASE_US` | `249,999 us` |
+| LPS22HB phase | `LPS22HB_PHASE_US` | `441,807 us` |
+| LIS3MDL phase | `LIS3MDL_PHASE_US` | `795,654 us` |
+| HAR / print schedule | `scheduler_events[]` | explicit 4-second table |
+| Gyro releases | `task_read_gyro` | strict `80 ms`, `50` per 4 seconds |
+| HTS221 releases | `task_read_hts221` | strict `1 s`, `4` per 4 seconds |
+| LPS22HB releases | `task_read_lps22hb` | strict `1 s`, `4` per 4 seconds |
+| LIS3MDL releases | `task_read_lis3mdl` | strict `800 ms`, `5` per 4 seconds |
 | HAR releases | `task_run_har_measure` | `4` per 4 seconds |
 | Print releases | `task_print_status` | `4` per 4 seconds |
 
@@ -71,8 +78,8 @@ All times below are planned releases in `[0 ms, 4000 ms)`.
 | --- | ---: | --- |
 | `gyro` | 50 | `57.692`, `134.615`, `211.538`, `288.461`, `365.384`, `480.769`, `519.230`, `596.153`, `673.076`, `749.999`, `826.922`, `865.384`, `1019.230`, `1096.153`, `1173.076`, `1288.461`, `1326.922`, `1403.845`, `1480.769`, `1557.692`, `1634.615`, `1711.538`, `1788.461`, `1865.384`, `1980.769`, `2057.692`, `2134.615`, `2211.538`, `2288.461`, `2365.384`, `2403.845`, `2519.230`, `2596.153`, `2673.076`, `2749.999`, `2865.384`, `2980.769`, `3019.230`, `3096.153`, `3173.076`, `3211.538`, `3326.922`, `3403.845`, `3480.769`, `3557.692`, `3673.076`, `3711.538`, `3788.461`, `3865.384`, `3980.769` |
 | `hts221` | 4 | `249.999`, `1249.999`, `2249.999`, `3249.999` |
-| `lps22hb` | 4 | `442.307`, `1442.307`, `2442.307`, `3442.307` |
-| `lis3mdl` | 5 | `403.845`, `1211.538`, `2019.230`, `2826.922`, `3634.615` |
+| `lps22hb` | 4 | `441.807`, `1441.807`, `2441.807`, `3441.807` |
+| `lis3mdl` | 5 | `795.654`, `1595.654`, `2395.654`, `3195.654`, `3995.654` |
 | `har` | 4 | `901.345`, `1901.345`, `2901.345`, `3901.345` |
 | `print` | 4 | `934.807`, `1934.807`, `2934.807`, `3934.807` |
 
@@ -88,40 +95,50 @@ schedule. Estimated durations are planning values only:
 | Task | Start ms | End ms | Previous accel ms | Next accel ms | Margin before ms | Margin after ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `hts221` | `249.999` | `250.999` | `230.769` | `269.230` | `19.230` | `18.231` |
-| `lis3mdl` | `403.845` | `404.845` | `384.615` | `423.076` | `19.230` | `18.231` |
-| `lps22hb` | `442.307` | `443.307` | `423.076` | `461.538` | `19.231` | `18.231` |
+| `lps22hb` | `441.807` | `442.807` | `423.076` | `461.538` | `18.731` | `18.731` |
 | `har` | `901.345` | `906.345` | `884.615` | `923.076` | `16.730` | `16.731` |
 | `print` | `934.807` | `949.807` | `923.076` | `961.538` | `11.731` | `11.731` |
-| `lis3mdl` | `1211.538` | `1212.538` | `1192.307` | `1230.769` | `19.231` | `18.231` |
 | `hts221` | `1249.999` | `1250.999` | `1230.769` | `1269.230` | `19.230` | `18.231` |
-| `lps22hb` | `1442.307` | `1443.307` | `1423.076` | `1461.538` | `19.231` | `18.231` |
+| `lps22hb` | `1441.807` | `1442.807` | `1423.076` | `1461.538` | `18.731` | `18.731` |
+| `lis3mdl` | `1595.654` | `1596.654` | `1576.923` | `1615.384` | `18.731` | `18.730` |
 | `har` | `1901.345` | `1906.345` | `1884.615` | `1923.076` | `16.730` | `16.731` |
 | `print` | `1934.807` | `1949.807` | `1923.076` | `1961.538` | `11.731` | `11.731` |
-| `lis3mdl` | `2019.230` | `2020.230` | `2000.000` | `2038.461` | `19.230` | `18.231` |
 | `hts221` | `2249.999` | `2250.999` | `2230.769` | `2269.230` | `19.230` | `18.231` |
-| `lps22hb` | `2442.307` | `2443.307` | `2423.076` | `2461.538` | `19.231` | `18.231` |
-| `lis3mdl` | `2826.922` | `2827.922` | `2807.692` | `2846.153` | `19.230` | `18.231` |
+| `lis3mdl` | `2395.654` | `2396.654` | `2384.615` | `2423.076` | `11.039` | `26.422` |
+| `lps22hb` | `2441.807` | `2442.807` | `2423.076` | `2461.538` | `18.731` | `18.731` |
 | `har` | `2901.345` | `2906.345` | `2884.615` | `2923.076` | `16.730` | `16.731` |
 | `print` | `2934.807` | `2949.807` | `2923.076` | `2961.538` | `11.731` | `11.731` |
+| `lis3mdl` | `3195.654` | `3196.654` | `3192.307` | `3230.769` | `3.347` | `34.115` |
 | `hts221` | `3249.999` | `3250.999` | `3230.769` | `3269.230` | `19.230` | `18.231` |
-| `lps22hb` | `3442.307` | `3443.307` | `3423.076` | `3461.538` | `19.231` | `18.231` |
-| `lis3mdl` | `3634.615` | `3635.615` | `3615.384` | `3653.846` | `19.231` | `18.231` |
+| `lps22hb` | `3441.807` | `3442.807` | `3423.076` | `3461.538` | `18.731` | `18.731` |
 | `har` | `3901.345` | `3906.345` | `3884.615` | `3923.076` | `16.730` | `16.731` |
 | `print` | `3934.807` | `3949.807` | `3923.076` | `3961.538` | `11.731` | `11.731` |
+| `lis3mdl` | `3995.654` | `3996.654` | `3961.538` | `4000.000` | `34.116` | `3.346` |
 
-The ordinary-task table deliberately allows non-uniform gyro spacing. The target
-is `50` gyro reads per 4 seconds, with each release placed away from accel.
+Gyro, HTS221, LPS22HB, and LIS3MDL are deliberately not included in the
+HAR/print event table. They remain strict periodic tasks so their reads stay
+matched to the hardware ODR and DRDY behavior.
 
 ## Close Releases With Current 3 ms Accel Guard
 
-There are currently no ordinary task releases within `ACCEL_GUARD_US` of an
-accel release by planned start time.
+These releases are within `ACCEL_GUARD_US` of an accel release by planned start
+time. They are currently all gyro releases; lower-priority table events are
+placed outside the guard.
+
+| Task | Task ms | Nearest accel ms | Delta ms |
+| --- | ---: | ---: | ---: |
+| `gyro` | `0.000` | `0.000` | `0.000` |
+| `gyro` | `960.000` | `961.538` | `-1.538` |
+| `gyro` | `1040.000` | `1038.461` | `1.539` |
+| `gyro` | `2000.000` | `2000.000` | `0.000` |
+| `gyro` | `2960.000` | `2961.538` | `-1.538` |
+| `gyro` | `3040.000` | `3038.461` | `1.539` |
 
 ## Adjustment Notes
 
 - Treat accel as the fixed reference track.
 - Move low-priority event offsets away from accel points when possible.
-- Gyro uses 50 explicit releases per 4 seconds instead of a strict 80 ms period.
+- Gyro remains strict 80 ms, so it can occasionally run close to accel.
 - `print` should stay low priority because UART output can block the scheduler.
 - HAR entries should leave enough room before the next accel sample for the
   worst-case inference time.

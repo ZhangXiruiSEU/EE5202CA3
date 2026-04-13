@@ -43,26 +43,27 @@ grid.
 
 - accelerometer: exact `26 Hz` pacing via a fractional interval accumulator
   over a `4 s` major cycle
-- gyroscope: `50` planned releases per `4 s` major cycle
-- magnetometer: `5` planned releases per `4 s` major cycle
-- HTS221: `4` planned releases per `4 s` major cycle
-- LPS22HB: `4` planned releases per `4 s` major cycle
+- gyroscope: every `80 ms`
+- magnetometer: every `800 ms`
+- HTS221: every `1000 ms`
+- LPS22HB: every `1000 ms`
 - HAR inference: `4` planned releases per `4 s` major cycle
 - UART print: `4` planned releases per `4 s` major cycle
 
 ### Ordinary-task table
 
-Ordinary tasks use an explicit 4-second release table in `src/main.c` instead
-of independent fixed periods. This keeps the average rates the same while
-placing each release inside an accelerometer gap.
+Gyro, HTS221, LPS22HB, and LIS3MDL are scheduled as strict periodic tasks so
+their reads stay aligned with the hardware ODR and DRDY behavior. HAR and UART
+print use an explicit 4-second release table in `src/main.c`, so the longer
+software-only work can be placed inside accelerometer gaps.
 
 | Task | Releases per 4 s | Placement |
 | --- | ---: | --- |
 | Accelerometer | 104 | Fractional 26 Hz accumulator |
-| Gyroscope | 50 | Midpoints of selected accel gaps |
-| HTS221 | 4 | Midpoints of selected accel gaps |
-| LPS22HB | 4 | Midpoints of selected accel gaps |
-| LIS3MDL | 5 | Midpoints of selected accel gaps |
+| Gyroscope | 50 | Strict 80 ms periodic releases |
+| HTS221 | 4 | Strict 1 s periodic releases |
+| LPS22HB | 4 | Strict 1 s periodic releases |
+| LIS3MDL | 5 | Strict 800 ms periodic releases |
 | HAR inference | 4 | Centered in accel gaps with about 5 ms reserved |
 | UART print | 4 | Centered in accel gaps with about 15 ms reserved |
 
