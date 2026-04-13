@@ -32,6 +32,10 @@ static void enqueue_accel_sample(struct app_context *ctx, const struct accel_sam
 {
 	struct accel_sample dropped;
 
+	if (!sensor_drdy_reserve_accel_in(sample->timestamp_us)) {
+		return;
+	}
+
 	k_mutex_lock(&app_lock, K_FOREVER);
 	memcpy(ctx->accel, sample->accel, sizeof(ctx->accel));
 	if (sample->late_us > 0U) {
@@ -61,7 +65,11 @@ void task_accel_sample(struct app_context *ctx, uint64_t timestamp_us, uint32_t 
 
 	sensor_drdy_poll_accel();
 
-	if (lsm6dsl_fifo_sample_count(&fifo_samples) == 0 && fifo_samples > 0U) {
+	if (lsm6dsl_fifo_sample_count(&fifo_samples) == 0) {
+		if (fifo_samples == 0U) {
+			return;
+		}
+
 		for (uint16_t i = 0U; i < fifo_samples; i++) {
 			uint64_t sample_age_us =
 				(uint64_t)(fifo_samples - 1U - i) * ACCEL_INTERVAL_BASE_US;
@@ -82,8 +90,8 @@ void task_accel_sample(struct app_context *ctx, uint64_t timestamp_us, uint32_t 
 	}
 
 	/*
-	 * FIFO can be empty immediately after startup or if the thread wakes
-	 * before the next hardware sample. Fall back to the current output regs.
+	 * If FIFO status cannot be read, keep the accel path alive by reading
+	 * the current output registers once.
 	 */
 	struct accel_sample sample = {
 		.timestamp_us = timestamp_us,

@@ -47,7 +47,16 @@ struct drdy_state {
 	struct drdy_counter hts221;
 	struct drdy_counter lis3mdl;
 	struct drdy_counter lps22hb;
+	struct drdy_counter report_accel;
+	struct drdy_counter report_gyro;
+	struct drdy_counter report_hts221;
+	struct drdy_counter report_lis3mdl;
+	struct drdy_counter report_lps22hb;
+	uint32_t accel_in;
+	uint32_t report_accel_in;
 	uint64_t window_start_us;
+	uint64_t report_window_start_us;
+	bool report_pending;
 	bool initialized;
 };
 
@@ -104,6 +113,46 @@ static void update_counter(struct drdy_counter *counter, bool data_ready, bool o
 	}
 }
 
+static void reset_current_counters(void)
+{
+	(void)memset(&drdy_state.accel, 0, sizeof(drdy_state.accel));
+	(void)memset(&drdy_state.gyro, 0, sizeof(drdy_state.gyro));
+	(void)memset(&drdy_state.hts221, 0, sizeof(drdy_state.hts221));
+	(void)memset(&drdy_state.lis3mdl, 0, sizeof(drdy_state.lis3mdl));
+	(void)memset(&drdy_state.lps22hb, 0, sizeof(drdy_state.lps22hb));
+	drdy_state.accel_in = 0U;
+}
+
+static void close_elapsed_windows_locked(uint64_t now_us)
+{
+	if (!drdy_state.initialized ||
+	    (now_us - drdy_state.window_start_us) < DRDY_WINDOW_US) {
+		return;
+	}
+
+	/*
+	 * Keep the report semantics fixed at 4 s. If the low-priority print
+	 * thread is late, counters after the boundary belong to the next
+	 * window instead of stretching the completed report to 5 s.
+	 */
+	if (!drdy_state.report_pending) {
+		drdy_state.report_accel = drdy_state.accel;
+		drdy_state.report_gyro = drdy_state.gyro;
+		drdy_state.report_hts221 = drdy_state.hts221;
+		drdy_state.report_lis3mdl = drdy_state.lis3mdl;
+		drdy_state.report_lps22hb = drdy_state.lps22hb;
+		drdy_state.report_accel_in = drdy_state.accel_in;
+		drdy_state.report_window_start_us = drdy_state.window_start_us;
+		drdy_state.report_pending = true;
+	}
+
+	reset_current_counters();
+
+	do {
+		drdy_state.window_start_us += DRDY_WINDOW_US;
+	} while ((now_us - drdy_state.window_start_us) >= DRDY_WINDOW_US);
+}
+
 static uint32_t percent_x100(uint32_t captured, uint32_t expected)
 {
 	uint32_t missed = 0U;
@@ -116,8 +165,7 @@ static uint32_t percent_x100(uint32_t captured, uint32_t expected)
 }
 
 static void append_counter(char *buf, size_t buf_size, size_t *offset, const char *name,
-			  const struct drdy_counter *counter, uint32_t expected,
-			  bool show_overrun)
+			  const struct drdy_counter *counter, uint32_t expected)
 {
 	uint32_t miss_x100 = percent_x100(counter->captured, expected);
 
@@ -125,24 +173,13 @@ static void append_counter(char *buf, size_t buf_size, size_t *offset, const cha
 		return;
 	}
 
-	if (show_overrun) {
-		drdy_append_fmt(buf, buf_size, offset, "%s=%u/%u d%u o%u (%u.%02u%%)",
-			       name,
-			       counter->captured,
-			       expected,
-			       counter->duplicates,
-			       counter->overruns,
-			       miss_x100 / 100U,
-			       miss_x100 % 100U);
-	} else {
-		drdy_append_fmt(buf, buf_size, offset, "%s=%u/%u d%u (%u.%02u%%)",
-			       name,
-			       counter->captured,
-			       expected,
-			       counter->duplicates,
-			       miss_x100 / 100U,
-			       miss_x100 % 100U);
-	}
+	drdy_append_fmt(buf, buf_size, offset, "%s=%u/%u d%u (%u.%02u%%)",
+		       name,
+		       counter->captured,
+		       expected,
+		       counter->duplicates,
+		       miss_x100 / 100U,
+		       miss_x100 % 100U);
 }
 
 int sensor_drdy_init(void)
@@ -177,6 +214,7 @@ void sensor_drdy_poll_accel(void)
 		return;
 	}
 
+	close_elapsed_windows_locked(k_ticks_to_us_floor64(k_uptime_ticks()));
 	update_counter(&drdy_state.accel, (status & LSM6DSL_STATUS_XLDA) != 0U, false);
 	k_mutex_unlock(&drdy_lock);
 }
@@ -197,6 +235,7 @@ void sensor_drdy_poll_gyro(void)
 		return;
 	}
 
+	close_elapsed_windows_locked(k_ticks_to_us_floor64(k_uptime_ticks()));
 	update_counter(&drdy_state.gyro, (status & LSM6DSL_STATUS_GDA) != 0U, false);
 	k_mutex_unlock(&drdy_lock);
 }
@@ -218,6 +257,7 @@ void sensor_drdy_poll_hts221(void)
 		return;
 	}
 
+	close_elapsed_windows_locked(k_ticks_to_us_floor64(k_uptime_ticks()));
 	ready = (status & (HTS221_STATUS_H_DA | HTS221_STATUS_T_DA)) != 0U;
 	update_counter(&drdy_state.hts221, ready, false);
 	k_mutex_unlock(&drdy_lock);
@@ -239,6 +279,7 @@ void sensor_drdy_poll_lis3mdl(void)
 		return;
 	}
 
+	close_elapsed_windows_locked(k_ticks_to_us_floor64(k_uptime_ticks()));
 	update_counter(&drdy_state.lis3mdl,
 		      (status & LIS3MDL_STATUS_ZYXDA) != 0U,
 		      (status & LIS3MDL_STATUS_ZYXOR) != 0U);
@@ -261,10 +302,42 @@ void sensor_drdy_poll_lps22hb(void)
 		return;
 	}
 
+	close_elapsed_windows_locked(k_ticks_to_us_floor64(k_uptime_ticks()));
 	update_counter(&drdy_state.lps22hb,
 		      (status & LPS22HB_STATUS_P_DA) != 0U,
 		      (status & LPS22HB_STATUS_P_OR) != 0U);
 	k_mutex_unlock(&drdy_lock);
+}
+
+bool sensor_drdy_reserve_accel_in(uint64_t sample_us)
+{
+	bool accepted = false;
+
+	k_mutex_lock(&drdy_lock, K_FOREVER);
+	if (!drdy_state.initialized) {
+		k_mutex_unlock(&drdy_lock);
+		return false;
+	}
+
+	if (sample_us < drdy_state.window_start_us) {
+		if (drdy_state.report_pending &&
+		    sample_us >= drdy_state.report_window_start_us &&
+		    sample_us < (drdy_state.report_window_start_us + DRDY_WINDOW_US) &&
+		    drdy_state.report_accel_in < ACCEL_EXPECTED_PER_WINDOW) {
+			drdy_state.report_accel_in++;
+			accepted = true;
+		}
+		k_mutex_unlock(&drdy_lock);
+		return accepted;
+	}
+
+	close_elapsed_windows_locked(sample_us);
+	if (drdy_state.accel_in < ACCEL_EXPECTED_PER_WINDOW) {
+		drdy_state.accel_in++;
+		accepted = true;
+	}
+	k_mutex_unlock(&drdy_lock);
+	return accepted;
 }
 
 bool sensor_drdy_report_ready(uint64_t now_us)
@@ -272,8 +345,8 @@ bool sensor_drdy_report_ready(uint64_t now_us)
 	bool ready;
 
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	ready = drdy_state.initialized &&
-		(now_us - drdy_state.window_start_us) >= DRDY_WINDOW_US;
+	close_elapsed_windows_locked(now_us);
+	ready = drdy_state.initialized && drdy_state.report_pending;
 	k_mutex_unlock(&drdy_lock);
 
 	return ready;
@@ -289,39 +362,35 @@ void sensor_drdy_format_report(char *buf, size_t buf_size, uint64_t now_us)
 
 	buf[0] = '\0';
 	k_mutex_lock(&drdy_lock, K_FOREVER);
-	if (!drdy_state.initialized ||
-	    (now_us - drdy_state.window_start_us) < DRDY_WINDOW_US) {
+	close_elapsed_windows_locked(now_us);
+	if (!drdy_state.initialized || !drdy_state.report_pending) {
 		k_mutex_unlock(&drdy_lock);
 		return;
 	}
 
 	/* Compact report format keeps UART output short enough for 1 Hz printing. */
 	drdy_append_fmt(buf, buf_size, &len, "drdy4s ");
-	append_counter(buf, buf_size, &len, "a", &drdy_state.accel, ACCEL_EXPECTED_PER_WINDOW,
-		      false);
+	append_counter(buf, buf_size, &len, "a", &drdy_state.report_accel,
+		      ACCEL_EXPECTED_PER_WINDOW);
+	drdy_append_fmt(buf, buf_size, &len, " accel_in=%u", drdy_state.report_accel_in);
 	drdy_append_fmt(buf, buf_size, &len, " ");
-	append_counter(buf, buf_size, &len, "g", &drdy_state.gyro, GYRO_EXPECTED_PER_WINDOW,
-		      false);
+	append_counter(buf, buf_size, &len, "g", &drdy_state.report_gyro,
+		      GYRO_EXPECTED_PER_WINDOW);
 	drdy_append_fmt(buf, buf_size, &len, " ");
-	append_counter(buf, buf_size, &len, "h", &drdy_state.hts221, HTS221_EXPECTED_PER_WINDOW,
-		      false);
+	append_counter(buf, buf_size, &len, "h", &drdy_state.report_hts221,
+		      HTS221_EXPECTED_PER_WINDOW);
 	drdy_append_fmt(buf, buf_size, &len, " ");
-	append_counter(buf, buf_size, &len, "m", &drdy_state.lis3mdl, LIS3MDL_EXPECTED_PER_WINDOW,
-		      true);
+	append_counter(buf, buf_size, &len, "m", &drdy_state.report_lis3mdl,
+		      LIS3MDL_EXPECTED_PER_WINDOW);
 	drdy_append_fmt(buf, buf_size, &len, " ");
-	append_counter(buf, buf_size, &len, "p", &drdy_state.lps22hb, LPS22HB_EXPECTED_PER_WINDOW,
-		      true);
+	append_counter(buf, buf_size, &len, "p", &drdy_state.report_lps22hb,
+		      LPS22HB_EXPECTED_PER_WINDOW);
 	drdy_append_fmt(buf, buf_size, &len, "\n");
 
 	if (len >= buf_size) {
 		buf[buf_size - 1U] = '\0';
 	}
 
-	(void)memset(&drdy_state.accel, 0, sizeof(drdy_state.accel));
-	(void)memset(&drdy_state.gyro, 0, sizeof(drdy_state.gyro));
-	(void)memset(&drdy_state.hts221, 0, sizeof(drdy_state.hts221));
-	(void)memset(&drdy_state.lis3mdl, 0, sizeof(drdy_state.lis3mdl));
-	(void)memset(&drdy_state.lps22hb, 0, sizeof(drdy_state.lps22hb));
-	drdy_state.window_start_us = now_us;
+	drdy_state.report_pending = false;
 	k_mutex_unlock(&drdy_lock);
 }
