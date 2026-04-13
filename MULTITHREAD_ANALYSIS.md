@@ -8,7 +8,7 @@ superloop. Sensor acquisition, HAR inference, status printing, and the
 urgent load are separated into their own kernel threads.
 
 For more background on how this Zephyr-based project differs from the default
-STM32CubeIDE workflow, as well as the development environment construction, see the ***Appendix A - Zephyr vs STM32Cube IDE***.
+STM32CubeIDE workflow, as well as the Zephyr development environment setup, see the ***Appendix A - Zephyr vs STM32Cube IDE***.
 
 ## Current Thread Model
 

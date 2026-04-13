@@ -27,11 +27,8 @@ definition and devicetree files.
 This project assumes a Zephyr command-line workspace rather than a standalone
 CubeIDE workspace.
 
-Set up Zephyr by following the official Getting Started Guide:
-
-```text
-https://docs.zephyrproject.org/latest/develop/getting_started/index.html
-```
+Set up Zephyr by following the
+[official Getting Started Guide](https://docs.zephyrproject.org/latest/develop/getting_started/index.html).
 
 After the Zephyr workspace is ready, place this project folder inside the
 workspace, for example:
